@@ -441,7 +441,7 @@ final class BenchmarkRunCommand
         // Post results
         $this->prSuccess($prNumber, "Benchmark complete: {$minTime}s");
         $this->githubComment($prNumber, <<<MD
-        Benchmarking complete! Mean execution time: **{$minTime}s**
+        Benchmarking complete! Best execution time: **{$minTime}s**
         
         Full results:
         
