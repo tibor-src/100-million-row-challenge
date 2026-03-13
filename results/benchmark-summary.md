@@ -507,3 +507,54 @@ This pass produced a significant speedup over iteration 8’s compliance-path ba
 
 4. **Current status vs top solution**
    - latest spot checks still show a gap to PR #203 on the 100M dataset.
+
+## Iteration 10 — function-level microbenching + online optimization checks
+
+- **Base commit:** `ce83bb43ce132cd5cd8f82dbf68e4f7cb13dcde6`
+- **Status:** ongoing, validation passing
+
+### What was added
+
+Standalone microbench harness:
+
+- `results/microbench/function_call_bench.php`
+- output snapshots:
+  - `results/microbench/function-call-bench-latest.json`
+  - `results/microbench/function-call-bench-repeat.json`
+
+### Online research + local confirmation
+
+Targeted web checks were run for:
+
+1. `min()`/`max()` function-call overhead vs inline branch logic
+2. `substr()` extraction vs character-by-character concatenation
+3. socket read strategy (`stream_select` loop vs sequential drain)
+
+Local microbench findings aligned with research:
+
+- branch check beat `min()` in synthetic loop
+- `substr()` strongly beat manual char concatenation
+- lookup-table byte increment beat ord/chr arithmetic
+- `strrpos` beat manual reverse scan
+
+### Parser-level application status
+
+- Function-level winners were evaluated for parser integration.
+- Not all microbench wins translated into stable end-to-end 100M wins under noisy host conditions.
+- A/B parser runs remained variance-sensitive; no clear retained change in this pass conclusively surpassed PR #203.
+
+### Single-core and multi-core evidence
+
+As requested, both modes continued to be captured for retained parser checks:
+
+- single-core sampled in high-40s seconds range
+- multi-core sampled around ~3.0–3.2s in this run window
+
+### Current top-3 standing
+
+Iteration-10 head-to-head batches versus PR #203 were mixed:
+
+- one 3-run batch favored current branch
+- another 3-run batch favored PR #203
+
+Conclusion: no stable overtake yet; continue with further targeted experiments.

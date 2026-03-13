@@ -205,7 +205,7 @@ final class Parser
         $pids = [];
 
         for ($workerIndex = 0; $workerIndex < $actualWorkers; $workerIndex++) {
-            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
 
             if ($pair === false) {
                 throw new RuntimeException('Unable to create worker socket pair');
@@ -243,7 +243,7 @@ final class Parser
             }
 
             fclose($pair[1]);
-            $sockets[$pid] = $pair[0];
+            $sockets[] = $pair[0];
             $pids[] = $pid;
         }
 
@@ -978,9 +978,9 @@ final class Parser
         $socketPidMap = [];
         $readBytes = max(8_192, $readBytes);
 
-        foreach ($sockets as $pid => $socket) {
-            $buffers[$pid] = '';
-            $socketPidMap[(int) $socket] = $pid;
+        foreach ($sockets as $workerKey => $socket) {
+            $buffers[$workerKey] = '';
+            $socketPidMap[(int) $socket] = $workerKey;
         }
 
         while ($sockets !== []) {
@@ -1005,14 +1005,14 @@ final class Parser
                 }
 
                 if ($chunk !== '') {
-                    $pid = $socketPidMap[(int) $socket];
-                    $buffers[$pid] .= $chunk;
+                    $workerKey = $socketPidMap[(int) $socket];
+                    $buffers[$workerKey] .= $chunk;
                 }
 
                 if (feof($socket)) {
-                    $pid = $socketPidMap[(int) $socket];
+                    $workerKey = $socketPidMap[(int) $socket];
                     fclose($socket);
-                    unset($sockets[$pid], $socketPidMap[(int) $socket]);
+                    unset($sockets[$workerKey], $socketPidMap[(int) $socket]);
                 }
             }
         }
