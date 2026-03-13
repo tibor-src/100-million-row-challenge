@@ -3,38 +3,6 @@
 
 use Tempest\Console\ConsoleApplication;
 
-if (($argv[1] ?? null) === 'data:parse') {
-    require_once __DIR__ . '/app/Parser.php';
-
-    $inputPath = __DIR__ . '/data/data.csv';
-    $outputPath = __DIR__ . '/data/data.json';
-
-    foreach (array_slice($argv, 2) as $argument) {
-        if (str_starts_with($argument, '--input-path=')) {
-            $inputPath = substr($argument, 13);
-            continue;
-        }
-
-        if (str_starts_with($argument, '--output-path=')) {
-            $outputPath = substr($argument, 14);
-            continue;
-        }
-
-        if ($inputPath === __DIR__ . '/data/data.csv') {
-            $inputPath = $argument;
-            continue;
-        }
-
-        if ($outputPath === __DIR__ . '/data/data.json') {
-            $outputPath = $argument;
-        }
-    }
-
-    \App\Parser::parse($inputPath, $outputPath);
-
-    exit;
-}
-
 require_once getcwd() . '/vendor/autoload.php';
 
 ConsoleApplication::boot(loadBuiltInCommands: false)->run();
