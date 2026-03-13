@@ -18,7 +18,7 @@ final class Parser
     private const int MULTI_PROCESS_THRESHOLD_BYTES = 134_217_728;
     private const int READ_CHUNK_BYTES = 262_144;
     private const int COUNTER_BYTES = 2;
-    private const string DEFAULT_MERGE_MODE = 'manual';
+    private const string DEFAULT_MERGE_MODE = 'sodium';
     private const int DEFAULT_UNROLL = 1;
     private const array MONTH_OFFSETS = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     private const array LEAP_MONTH_OFFSETS = [0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
@@ -649,11 +649,17 @@ final class Parser
     {
         $configured = getenv('TEMPEST_PARSER_MERGE');
 
-        if ($configured === 'sodium') {
+        if ($configured === 'sodium' && function_exists('sodium_add')) {
             return 'sodium';
         }
 
-        return self::DEFAULT_MERGE_MODE;
+        if ($configured === 'manual') {
+            return 'manual';
+        }
+
+        return function_exists('sodium_add')
+            ? self::DEFAULT_MERGE_MODE
+            : 'manual';
     }
 
     private static function resolveUnrollFactor(): int
