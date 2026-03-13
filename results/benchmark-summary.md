@@ -353,3 +353,13 @@ So the compliance decision trades away some absolute speed versus the earlier by
 ### Further gains attempted in this pass
 
 After host-aware adoption, additional parameter sweeps (merge/worker/chunk settings) produced only marginal changes and no clear structural win.
+
+## Iteration 7 — additional hot-loop experiment (discarded)
+
+An extra optimization attempt replaced the trusted packed-loop date lookup map with direct ASCII digit arithmetic (no substring/hash lookup).
+
+- result: **regressed sharply** to ~5.57s on 100M
+- correctness: output hash still matched
+- action: change reverted immediately
+
+Conclusion from this attempt: in this runtime profile, hash-map lookup for the 7-char date key remains faster than this arithmetic variant in the hottest loop.
