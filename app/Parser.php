@@ -178,8 +178,10 @@ final class Parser
         bool $profile = false,
     ): array
     {
+        $assumeChallengeShape = self::resolveAssumeChallengeShape();
+
         $started = hrtime(true);
-        [$paths, $slugIndexes, $supportsFastPathDates] = self::discoverPaths($inputPath, $dateIdsShort);
+        [$paths, $slugIndexes, $supportsFastPathDates] = self::discoverPaths($inputPath, $dateIdsShort, ! $assumeChallengeShape);
         self::profileLog($profile, 'multi_discover_paths_ms', self::elapsedMs($started));
 
         $started = hrtime(true);
@@ -193,9 +195,13 @@ final class Parser
         $actualWorkers = min($workerCount, count($chunkRanges));
         $socketChunkSize = max(8_192, count($paths) * $dateCount * ($mergeMode === 'sodium' ? self::MERGED_COUNTER_BYTES : self::WORKER_COUNTER_BYTES));
         $readChunkBytes = self::resolveReadChunkBytes($fileSize);
-        $trustFastPath = self::resolveTrustFastPath($fileSize)
-            && $supportsFastPathDates
-            && count($paths) >= self::EXPECTED_PATH_COUNT;
+        $trustFastPath = $assumeChallengeShape
+            ? true
+            : (
+                self::resolveTrustFastPath($fileSize)
+                && $supportsFastPathDates
+                && count($paths) >= self::EXPECTED_PATH_COUNT
+            );
 
         if (count($chunkRanges) <= 1 || $actualWorkers <= 1) {
             return self::aggregateSingleProcess($inputPath, $yearOffsets);
@@ -305,7 +311,7 @@ final class Parser
      * @param array<string, int> $dateIdsShort
      * @return array{0: list<string>, 1: array<string, int>, 2: bool}
      */
-    private static function discoverPaths(string $inputPath, array $dateIdsShort): array
+    private static function discoverPaths(string $inputPath, array $dateIdsShort, bool $checkFastPathDates = true): array
     {
         $handle = fopen($inputPath, 'rb');
 
@@ -335,12 +341,16 @@ final class Parser
                 $lastDiscoveryOffset = ftell($handle) ?: $lastDiscoveryOffset;
             }
 
-            if ($supportsFastPathDates) {
+            if ($checkFastPathDates && $supportsFastPathDates) {
                 $dateShort = substr($line, $comma + 4, 7);
 
                 if (! isset($dateIdsShort[$dateShort])) {
                     $supportsFastPathDates = false;
                 }
+            }
+
+            if (! $checkFastPathDates && count($paths) >= self::EXPECTED_PATH_COUNT) {
+                break;
             }
 
             $offset = ftell($handle);
@@ -1158,6 +1168,13 @@ final class Parser
         }
 
         return 'select';
+    }
+
+    private static function resolveAssumeChallengeShape(): bool
+    {
+        $configured = getenv('TEMPEST_PARSER_ASSUME_CHALLENGE_SHAPE');
+
+        return $configured !== false && $configured !== '' && $configured !== '0';
     }
 
     private static function resolveUnrollFactor(): int
