@@ -14,6 +14,7 @@ final class Parser
     private const int DATE_START_YEAR = 2021;
     private const int DATE_END_YEAR = 2026;
     private const int DEFAULT_WORKERS = 8;
+    private const int MAX_WORKERS = 16;
     private const int MULTI_PROCESS_THRESHOLD_BYTES = 134_217_728;
     private const int DISCOVERY_IDLE_BYTES = 1_048_576;
     private const int CHUNK_TARGET_BYTES = 8_388_608;
@@ -41,12 +42,21 @@ final class Parser
             $dateIdsShort = self::buildShortDateIds($dateStrings);
 
             $started = hrtime(true);
-            $workerCount = self::resolveWorkerCount($inputPath);
+            $fileSize = filesize($inputPath);
+            $workerCount = self::resolveWorkerCount($fileSize === false ? 0 : $fileSize);
             self::profileLog($profile, 'resolve_workers_ms', self::elapsedMs($started));
 
             if ($workerCount > 1) {
                 $started = hrtime(true);
-                [$paths, $counts] = self::aggregateMultiProcess($inputPath, $yearOffsets, $dateIdsShort, count($dateStrings), $workerCount, $profile);
+                [$paths, $counts] = self::aggregateMultiProcess(
+                    $inputPath,
+                    $yearOffsets,
+                    $dateIdsShort,
+                    count($dateStrings),
+                    $fileSize === false ? 0 : $fileSize,
+                    $workerCount,
+                    $profile,
+                );
                 self::profileLog($profile, 'aggregate_multi_ms', self::elapsedMs($started));
                 $needsDateSort = false;
             } else {
@@ -74,7 +84,7 @@ final class Parser
         self::profileLog($profile, 'total_parse_ms', self::elapsedMs($parseStarted));
     }
 
-    private static function resolveWorkerCount(string $inputPath): int
+    private static function resolveWorkerCount(int $fileSize): int
     {
         $configured = getenv('TEMPEST_PARSER_WORKERS');
 
@@ -86,13 +96,25 @@ final class Parser
             return 1;
         }
 
-        $fileSize = filesize($inputPath);
-
-        if ($fileSize === false || $fileSize < self::MULTI_PROCESS_THRESHOLD_BYTES) {
+        if ($fileSize < self::MULTI_PROCESS_THRESHOLD_BYTES) {
             return 1;
         }
 
-        return self::DEFAULT_WORKERS;
+        $cpuCount = self::resolveCpuCount();
+
+        if ($cpuCount <= 1) {
+            return 1;
+        }
+
+        $workers = $cpuCount <= 4
+            ? $cpuCount * 2
+            : $cpuCount;
+
+        if ($fileSize < 1_073_741_824) {
+            $workers = min(8, $workers);
+        }
+
+        return max(2, min(self::MAX_WORKERS, $workers));
     }
 
     /**
@@ -150,6 +172,7 @@ final class Parser
         array $yearOffsets,
         array $dateIdsShort,
         int $dateCount,
+        int $fileSize,
         int $workerCount,
         bool $profile = false,
     ): array
@@ -163,10 +186,12 @@ final class Parser
         self::profileLog($profile, 'multi_build_tail_map_ms', self::elapsedMs($started));
 
         $started = hrtime(true);
-        $chunkRanges = self::calculateChunkRanges($inputPath);
+        $chunkRanges = self::calculateChunkRanges($inputPath, $fileSize, $workerCount);
         self::profileLog($profile, 'multi_boundaries_ms', self::elapsedMs($started));
         $mergeMode = self::resolveMergeMode();
         $actualWorkers = min($workerCount, count($chunkRanges));
+        $readChunkBytes = self::resolveReadChunkBytes($fileSize);
+        $trustFastPath = self::resolveTrustFastPath($fileSize);
 
         if (count($chunkRanges) <= 1 || $actualWorkers <= 1) {
             return self::aggregateSingleProcess($inputPath, $yearOffsets);
@@ -203,6 +228,8 @@ final class Parser
                     $tailOffset,
                     $fence,
                     $mergeMode,
+                    $readChunkBytes,
+                    $trustFastPath,
                     $dateCount,
                     $pair[1],
                 );
@@ -319,7 +346,7 @@ final class Parser
     /**
      * @return list<array{0: int, 1: int}>
      */
-    private static function calculateChunkRanges(string $inputPath): array
+    private static function calculateChunkRanges(string $inputPath, int $fileSize, int $workerCount): array
     {
         $handle = fopen($inputPath, 'rb');
 
@@ -329,14 +356,7 @@ final class Parser
 
         stream_set_read_buffer($handle, 0);
 
-        $fileSize = filesize($inputPath);
-
-        if ($fileSize === false) {
-            fclose($handle);
-            throw new RuntimeException("Unable to determine file size: {$inputPath}");
-        }
-
-        $chunkTarget = self::resolveChunkTargetBytes();
+        $chunkTarget = self::resolveChunkTargetBytes($fileSize, $workerCount);
         $ranges = [];
         $start = 0;
 
@@ -375,12 +395,13 @@ final class Parser
         int $tailOffset,
         int $fence,
         string $mergeMode,
+        int $readChunkBytes,
+        bool $trustFastPath,
         int $dateCount,
         mixed $socket,
     ): never {
         try {
             $buffer = str_repeat("\0", count($slugIndexes) * $dateCount * self::WORKER_COUNTER_BYTES);
-            $trustFastPath = self::resolveTrustFastPath();
 
             for ($chunkIndex = $workerIndex; $chunkIndex < count($chunkRanges); $chunkIndex += $workerCount) {
                 [$start, $end] = $chunkRanges[$chunkIndex];
@@ -398,6 +419,7 @@ final class Parser
                     $fence,
                     $dateCount,
                     $trustFastPath,
+                    $readChunkBytes,
                     $buffer,
                 );
             }
@@ -442,6 +464,7 @@ final class Parser
         int $fence,
         int $dateCount,
         bool $trustFastPath,
+        int $readChunkBytes,
         string &$buffer,
     ): void {
         $handle = fopen($inputPath, 'rb');
@@ -456,7 +479,6 @@ final class Parser
         $remaining = $end - $start;
         $carry = '';
         $nextBytes = self::byteLookup();
-        $readChunkBytes = self::resolveReadChunkBytes();
         $unrollFactor = self::resolveUnrollFactor();
 
         while ($remaining > 0) {
@@ -878,7 +900,7 @@ final class Parser
         return $buffer;
     }
 
-    private static function resolveReadChunkBytes(): int
+    private static function resolveReadChunkBytes(int $fileSize): int
     {
         $configured = getenv('TEMPEST_PARSER_CHUNK_BYTES');
 
@@ -886,7 +908,15 @@ final class Parser
             return max(8_192, (int) $configured);
         }
 
-        return self::READ_CHUNK_BYTES;
+        if ($fileSize >= 2_147_483_648) {
+            return 163_840;
+        }
+
+        if ($fileSize >= 536_870_912) {
+            return 131_072;
+        }
+
+        return 65_536;
     }
 
     private static function resolveDiscoveryIdleBytes(): int
@@ -900,7 +930,7 @@ final class Parser
         return self::DISCOVERY_IDLE_BYTES;
     }
 
-    private static function resolveChunkTargetBytes(): int
+    private static function resolveChunkTargetBytes(int $fileSize, int $workerCount): int
     {
         $configured = getenv('TEMPEST_PARSER_CHUNK_TARGET_BYTES');
 
@@ -908,14 +938,55 @@ final class Parser
             return max(1_048_576, (int) $configured);
         }
 
-        return self::CHUNK_TARGET_BYTES;
+        if ($fileSize <= 0) {
+            return self::CHUNK_TARGET_BYTES;
+        }
+
+        $target = intdiv($fileSize, max(8, $workerCount * 6));
+
+        return max(8_388_608, min(33_554_432, $target));
     }
 
-    private static function resolveTrustFastPath(): bool
+    private static function resolveTrustFastPath(int $fileSize): bool
     {
         $configured = getenv('TEMPEST_PARSER_TRUST_FAST_PATH');
 
-        return $configured !== false && $configured !== '' && $configured !== '0';
+        if ($configured !== false && $configured !== '') {
+            return $configured !== '0';
+        }
+
+        return $fileSize >= 1_073_741_824;
+    }
+
+    private static function resolveCpuCount(): int
+    {
+        static $cached = null;
+
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $configured = getenv('TEMPEST_PARSER_CPU_COUNT');
+
+        if ($configured !== false && $configured !== '') {
+            $cached = max(1, (int) $configured);
+            return $cached;
+        }
+
+        $nproc = @shell_exec('getconf _NPROCESSORS_ONLN 2>/dev/null');
+
+        if (is_string($nproc)) {
+            $value = (int) trim($nproc);
+
+            if ($value > 0) {
+                $cached = $value;
+                return $cached;
+            }
+        }
+
+        $cached = self::DEFAULT_WORKERS;
+
+        return $cached;
     }
 
     private static function resolveMergeMode(): string
