@@ -1,0 +1,3 @@
+timestamp,commit,label,dataset,workers,command,status,seconds,notes
+2026-03-13T11:44:02Z,9113298c1f2771a317d0117f733561c23af70148,pre-implementation-baseline,test-data,n/a,"php tempest data:validate",fail,,"Parser still throws TODO exception"
+2026-03-13T11:44:02Z,9113298c1f2771a317d0117f733561c23af70148,pre-implementation-baseline,test-data,n/a,"php tempest data:parse --input-path=/workspace/data/test-data.csv --output-path=/workspace/data/test-data-actual.json",fail,,"Parser still throws TODO exception"
