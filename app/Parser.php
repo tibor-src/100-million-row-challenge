@@ -244,7 +244,7 @@ final class Parser
             if (
                 $offset !== false
                 && $lastDiscoveryOffset !== 0
-                && $offset - $lastDiscoveryOffset >= self::DISCOVERY_IDLE_BYTES
+                && $offset - $lastDiscoveryOffset >= self::resolveDiscoveryIdleBytes()
             ) {
                 break;
             }
@@ -673,6 +673,17 @@ final class Parser
         }
 
         return self::READ_CHUNK_BYTES;
+    }
+
+    private static function resolveDiscoveryIdleBytes(): int
+    {
+        $configured = getenv('TEMPEST_PARSER_DISCOVERY_IDLE_BYTES');
+
+        if ($configured !== false && $configured !== '') {
+            return max(65_536, (int) $configured);
+        }
+
+        return self::DISCOVERY_IDLE_BYTES;
     }
 
     private static function resolveMergeMode(): string
