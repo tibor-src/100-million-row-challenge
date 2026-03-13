@@ -506,87 +506,46 @@ final class Parser
         $nextBytes = self::byteLookup();
 
         if ($packedTailMap !== []) {
-            if ($trustFastPath) {
-                while ($remaining > 0) {
-                    $chunk = fread($handle, min($readChunkBytes, $remaining));
+            while ($remaining > 0) {
+                $chunk = fread($handle, min($readChunkBytes, $remaining));
 
-                    if ($chunk === false) {
-                        fclose($handle);
-                        throw new RuntimeException('Unable to read chunk data');
-                    }
-
-                    if ($chunk === '') {
-                        break;
-                    }
-
-                    $chunkLength = strlen($chunk);
-                    $remaining -= $chunkLength;
-                    $lastNewline = strrpos($chunk, "\n");
-
-                    if ($lastNewline === false) {
-                        break;
-                    }
-
-                    $tail = $chunkLength - $lastNewline - 1;
-
-                    if ($tail > 0) {
-                        fseek($handle, -$tail, SEEK_CUR);
-                        $remaining += $tail;
-                    }
-
-                    self::consumePackedBufferTrusted(
-                        $chunk,
-                        $buffer,
-                        $packedTailMap,
-                        $dateIdsShort,
-                        $nextBytes,
-                        $tailLength,
-                        $tailOffset,
-                        $fence,
-                        $lastNewline,
-                    );
+                if ($chunk === false) {
+                    fclose($handle);
+                    throw new RuntimeException('Unable to read chunk data');
                 }
-            } else {
-                while ($remaining > 0) {
-                    $chunk = fread($handle, min($readChunkBytes, $remaining));
 
-                    if ($chunk === false) {
-                        fclose($handle);
-                        throw new RuntimeException('Unable to read chunk data');
-                    }
-
-                    if ($chunk === '') {
-                        break;
-                    }
-
-                    $chunkLength = strlen($chunk);
-                    $remaining -= $chunkLength;
-                    $lastNewline = strrpos($chunk, "\n");
-
-                    if ($lastNewline === false) {
-                        break;
-                    }
-
-                    $tail = $chunkLength - $lastNewline - 1;
-
-                    if ($tail > 0) {
-                        fseek($handle, -$tail, SEEK_CUR);
-                        $remaining += $tail;
-                    }
-
-                    self::consumePackedBufferSafe(
-                        $chunk,
-                        $buffer,
-                        $packedTailMap,
-                        $dateIdsShort,
-                        $nextBytes,
-                        $tailLength,
-                        $tailOffset,
-                        $fence,
-                        $dateCount,
-                        $lastNewline,
-                    );
+                if ($chunk === '') {
+                    break;
                 }
+
+                $chunkLength = strlen($chunk);
+                $remaining -= $chunkLength;
+                $lastNewline = strrpos($chunk, "\n");
+
+                if ($lastNewline === false) {
+                    break;
+                }
+
+                $tail = $chunkLength - $lastNewline - 1;
+
+                if ($tail > 0) {
+                    fseek($handle, -$tail, SEEK_CUR);
+                    $remaining += $tail;
+                }
+
+                self::consumePackedBuffer(
+                    $chunk,
+                    $buffer,
+                    $packedTailMap,
+                    $dateIdsShort,
+                    $nextBytes,
+                    $tailLength,
+                    $tailOffset,
+                    $fence,
+                    $dateCount,
+                    $trustFastPath,
+                    $lastNewline,
+                );
             }
 
             fclose($handle);
@@ -768,7 +727,7 @@ final class Parser
      * @param array<string, int> $dateIdsShort
      * @param list<string> $nextBytes
      */
-    private static function consumePackedBufferSafe(
+    private static function consumePackedBuffer(
         string $data,
         string &$countsBuffer,
         array $packedTailMap,
@@ -778,8 +737,14 @@ final class Parser
         int $tailOffset,
         int $fence,
         int $dateCount,
+        bool $trustFastPath,
         ?int $pointer = null,
     ): void {
+        if ($trustFastPath) {
+            self::consumePackedBufferTrusted($data, $countsBuffer, $packedTailMap, $dateIdsShort, $nextBytes, $tailLength, $tailOffset, $fence, $pointer);
+            return;
+        }
+
         $pointer ??= strlen($data) - 1;
         $mask = self::PACKED_INDEX_MASK;
         $shift = self::PACKED_INDEX_BITS;
