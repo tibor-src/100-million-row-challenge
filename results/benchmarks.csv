@@ -1,3 +1,5 @@
 timestamp,commit,label,dataset,workers,command,status,seconds,notes
 2026-03-13T11:44:02Z,9113298c1f2771a317d0117f733561c23af70148,pre-implementation-baseline,test-data,n/a,"php tempest data:validate",fail,,"Parser still throws TODO exception"
 2026-03-13T11:44:02Z,9113298c1f2771a317d0117f733561c23af70148,pre-implementation-baseline,test-data,n/a,"php tempest data:parse --input-path=/workspace/data/test-data.csv --output-path=/workspace/data/test-data-actual.json",fail,,"Parser still throws TODO exception"
+2026-03-13T11:44:02Z,a8f3058f66cfec8b821f1e1953998ef303f4db47,iteration-1-correct-single-core,test-data,1,"php tempest data:validate",pass,0.003050089,"Validation passed with static parser entrypoint and tempest fast path"
+2026-03-13T11:44:02Z,a8f3058f66cfec8b821f1e1953998ef303f4db47,iteration-1-correct-single-core,1M-dev,1,"php tempest data:parse --input-path=/workspace/data/data.csv --output-path=/workspace/data/data.json",pass,0.539025068,"Median of 3 runs using the current single-process implementation"
