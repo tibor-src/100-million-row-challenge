@@ -16,7 +16,7 @@ final class Parser
     private const int DATE_END_YEAR = 2026;
     private const int DEFAULT_WORKERS = 8;
     private const int MULTI_PROCESS_THRESHOLD_BYTES = 134_217_728;
-    private const int READ_CHUNK_BYTES = 262_144;
+    private const int READ_CHUNK_BYTES = 131_072;
     private const int COUNTER_BYTES = 2;
     private const string DEFAULT_MERGE_MODE = 'sodium';
     private const int DEFAULT_UNROLL = 1;
