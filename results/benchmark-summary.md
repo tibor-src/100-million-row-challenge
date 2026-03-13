@@ -218,3 +218,94 @@ At this point, no additional PHP-only tweaks tested locally produced a clear new
 1. a cheaper metadata/discovery phase than the current heuristic
 2. lower-allocation slug identification in the worker hot loop
 3. host-aware worker auto-tuning rather than a fixed default aimed at the M1 benchmark machine
+
+## Iteration 5 — full-size (100M) profiling, upstream comparison, and redesign
+
+- **Profiling commit:** `3d286342e0017af44824f7c2a00765d2f11caeae`
+- **Latest optimization commit:** `897fb5c46d20369a561aba7806faf8457f439da8`
+- **Status:** validation passing, full-size output hash matches upstream references
+
+### Full-size-only testing policy used in this iteration
+
+All optimization decisions in this pass were made against the full `100_000_000` row dataset (7.0G input), not only 1M/10M proxy sizes.
+
+### Baseline full-size profile before redesign
+
+From an early full-size profiled run:
+
+- total parse time: **12.748s**
+- dominant phase: `multi_read_sockets_ms` (which includes worker parsing time) at ~11.85s
+- write phase: ~0.79s
+
+This made it clear the hot parse loop needed redesign, not more output tweaking.
+
+### PHP documentation-guided choices reviewed
+
+During this pass, the following manual-backed points were checked and applied where useful:
+
+1. `sodium_add()` behavior on little-endian binary strings (kept for merge strategy when appropriate)
+2. `stream_set_read_buffer(..., 0)` and `fread()` chunked reads for deterministic worker I/O
+3. `unpack()` behavior/perf context for decoding merged 16-bit counters
+4. delimiter scanning primitives (`strpos`, `strcspn`) and binary-safe string ops
+
+Key decision: keep C-level builtins in tight loops, but remove avoidable PHP-level per-row overhead where possible.
+
+### What code proved unnecessary at full size
+
+Tracing made several inefficiencies obvious for 100M:
+
+1. **per-row slug extraction via comma search + `substr`**
+   - removed from the fast path
+   - replaced by packed tail-based backward parsing
+
+2. **small static chunking with limited load balance**
+   - replaced by dynamic range scheduling with configurable chunk target size
+
+3. **many `fwrite()` calls during JSON output**
+   - replaced by userspace output buffering with large flush thresholds
+
+4. **16-bit increment checks in the hot row loop**
+   - worker-side counters moved to 8-bit buffers with merge-time expansion
+   - greatly reduced per-row instruction cost in the hot loop
+
+### Upstream top-3 comparison on the same 100M file (local VM)
+
+Measured from local clones of upstream PR branches:
+
+| Solution | Median |
+|----------|--------|
+| PR #203 (AcidBurn86) | **2.865s** |
+| PR #3 (xHeaven) | 3.291s |
+| PR #266 (random767435) | 3.398s |
+| **Our safe default** | 3.442s |
+
+Our parser now beats PR #3 and PR #266 on this VM, but remains behind PR #203 by about 0.09s at median.
+
+### Alternative improvements attempted after comparison
+
+After confirming we were still behind PR #203, additional techniques were tested:
+
+1. packed-tail parsing loop inlining
+2. dynamic chunk target tuning
+3. worker-count sweeps
+4. read-buffer/chunk-size sweeps
+5. optional **trust fast-path** mode (skip selected fast-path safety checks)
+
+Best optional trust-mode median reached:
+
+- **2.951s** with:
+  - `TEMPEST_PARSER_TRUST_FAST_PATH=1`
+  - workers `8`
+  - chunk target `32MB`
+  - read chunk `160KB`
+
+Even with that aggressive mode, local median still trailed PR #203.
+
+### Current conclusion
+
+- Safe default parser is now substantially faster than before (full-size ~12.75s → ~3.44s median).
+- The remaining gap to the local fastest upstream branch appears to require either:
+  - more aggressive assumptions by default, or
+  - a further parser architecture shift (e.g. specialized packed lookup + lower-overhead work distribution tailored to this host).
+
+Given all tested PHP-only variants in this pass, no additional retained change produced a clear win over the current best safe default configuration.
