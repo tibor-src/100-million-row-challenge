@@ -190,6 +190,7 @@ final class Parser
         self::profileLog($profile, 'multi_boundaries_ms', self::elapsedMs($started));
         $mergeMode = self::resolveMergeMode();
         $actualWorkers = min($workerCount, count($chunkRanges));
+        $socketChunkSize = max(8_192, count($paths) * $dateCount * ($mergeMode === 'sodium' ? self::MERGED_COUNTER_BYTES : self::WORKER_COUNTER_BYTES));
         $readChunkBytes = self::resolveReadChunkBytes($fileSize);
         $trustFastPath = self::resolveTrustFastPath($fileSize);
 
@@ -206,6 +207,9 @@ final class Parser
             if ($pair === false) {
                 throw new RuntimeException('Unable to create worker socket pair');
             }
+
+            stream_set_chunk_size($pair[0], $socketChunkSize);
+            stream_set_chunk_size($pair[1], $socketChunkSize);
 
             $pid = pcntl_fork();
 
@@ -881,20 +885,10 @@ final class Parser
 
     private static function readSocket(mixed $socket): string
     {
-        $buffer = '';
+        $buffer = stream_get_contents($socket);
 
-        while (! feof($socket)) {
-            $chunk = fread($socket, 65_536);
-
-            if ($chunk === false) {
-                throw new RuntimeException('Unable to read worker buffer from socket');
-            }
-
-            if ($chunk === '') {
-                break;
-            }
-
-            $buffer .= $chunk;
+        if ($buffer === false) {
+            throw new RuntimeException('Unable to read worker buffer from socket');
         }
 
         return $buffer;
