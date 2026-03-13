@@ -92,3 +92,53 @@ Observation: on the 10M dataset, 8 workers narrowly beat 4 workers and delivered
 ### Adaptive decision
 
 The parser now stays single-process for inputs below `128MB` and switches to multi-process above that threshold. This preserves low-overhead behavior on small datasets while still enabling strong multi-core scaling on larger inputs.
+
+## Iteration 3 — Phase D tuning outcomes
+
+- **Final tuned commit:** `f350689c0be8ccacf199b2664125c626a7a99adc`
+- **Status:** validation passing
+
+### Merge strategy comparison on 10M data
+
+| Merge mode | Workers | Time |
+|------------|---------|------|
+| manual | 8 | 1.999212s |
+| sodium | 8 | 1.761746s |
+
+**Decision:** keep `sodium_add()` as the default worker-buffer merge strategy. It reduced total runtime by about **0.24s** on the 10M dataset while still matching manual-merge output byte-for-byte.
+
+### Read chunk size comparison on 10M data with sodium merge
+
+| Chunk bytes | Time |
+|-------------|------|
+| 131072 | 1.735399s (median of 3) |
+| 262144 | 1.771460s (median of 3) |
+| 524288 | 1.778049s |
+| 1048576 | 1.805119s |
+
+**Decision:** keep `131072` bytes as the default worker read chunk size. It was the clearest local win after sodium merge became the default.
+
+### Unroll comparison on 10M data with sodium merge
+
+| Unroll factor | Time |
+|---------------|------|
+| 1 | 1.775947s |
+| 2 | 1.776658s |
+
+**Decision:** keep unroll factor `1`. The simple duplicated two-row loop was slightly slower and did not justify replacing the default path.
+
+### Worker count spot-check with final merge/chunk settings
+
+| Workers | Time |
+|---------|------|
+| 4 | 1.778773s |
+| 8 | 1.780939s |
+
+**Decision:** local 4-worker and 8-worker results were effectively tied after tuning. The parser keeps the 8-worker default for large files because the challenge target is still an 8-core benchmark host, while `TEMPEST_PARSER_WORKERS` remains available for local overrides.
+
+### Final current default result
+
+- `php tempest data:parse --input-path=/workspace/data/data.csv --output-path=/workspace/data/data.json`
+- **10M auto benchmark:** `1.734105s`
+
+Compared with the earlier adaptive multi-process default (`1.930535s`), the retained Phase D tuning changes improved the 10M default path by about **0.196s**.
