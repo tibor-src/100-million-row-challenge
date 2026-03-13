@@ -426,3 +426,84 @@ On this 4-core VM, spot checks continue to show:
 - PR #203 still ahead in absolute median
 
 But this pass improved compliance-path throughput while keeping adaptability and contender-aligned command behavior.
+
+## Iteration 9 — PHP-only hot-loop redesign + workflow skill docs
+
+- **Code baseline commit for this section:** `43b5547427f8fffe451f250dc638e7ba8c393cee` (starting point)
+- **Status:** in-progress optimization cycle, validation passing
+
+### Workflow/skill improvements added
+
+To make grind iterations more repeatable, three SOP-style docs were added:
+
+1. `docs/skills/experiment-hypothesis-template.md`
+2. `docs/skills/benchmark-matrix.md`
+3. `docs/skills/performance-triage.md`
+
+These standardize: hypothesis format, mandatory single/multi-core evidence, top3 comparison cadence, and keep/reject criteria.
+
+### Retained parser changes in this pass
+
+1. packed-chunk worker loop switched from carry concatenation to newline-rewind chunk handling
+2. trusted packed parser loop switched from dynamic `for` unroll to explicit 10-step manual unroll
+3. socket read mode made selectable, with `stream_select` mode retained as default after A/B tests
+4. trust-fast-path guard tightened to include date-shape sampling from discovery lines (prevents crashes on out-of-range seeded datasets)
+
+### 100M performance snapshot after retained changes
+
+| Mode | Result |
+|------|--------|
+| single-core (`workers=1`) | ~41.84s (2-run sample) |
+| multi-core tuned (`workers=8,target=36MB,chunk=144KB`) | ~2.947s median (5 runs) |
+
+### Socket read mode A/B result
+
+| Socket read mode | Median (3 runs) |
+|------------------|-----------------|
+| `select` | **2.930s** |
+| `sequential` | 2.950s |
+
+Decision: keep `select` as default.
+
+### Top-3 comparison refresh (100M)
+
+Three-run spot comparison:
+
+- current branch median: **2.981s**
+- PR #203 median: **2.812s**
+- PR #3 median: 3.265s
+- PR #266 median: 3.167s
+
+Current branch remains behind PR #203 but ahead of PR #3 and PR #266 in this sample.
+
+### Additional dataset matrix (20M, realistic seeds)
+
+Two extra seeded datasets were generated and benchmarked against top 3 with both single/multi-core runs for current branch.
+
+Observed pattern:
+
+- current branch maintains strong scaling from single-core to multi-core
+- PR #203 remains the strongest comparator on these additional seeds
+
+### Out-of-range seed robustness check
+
+A non-challenge-like seed (`12345`, yielding 1960s dates) previously caused trust-path worker failures. After date-shape trust gating, parser no longer crashes and safely falls back (slower, but correct behavior).
+
+### Current standing
+
+This pass produced a significant speedup over iteration 8’s compliance-path baseline but has **not yet surpassed PR #203** on 100M in repeated comparisons.
+
+### Additional findings later in iteration 9
+
+1. **Trust-gating bug fixed**
+   - initial date-shape check used wrong substring offset and accidentally disabled trust path on challenge-shaped data.
+   - fixed to align with packed parser short-date key extraction.
+
+2. **Out-of-range dataset safety restored**
+   - seeded dataset with 1960s dates no longer crashes workers; parser falls back safely.
+
+3. **Rejected experiment: unpack-based dense decode**
+   - replacing ord-based decode with `unpack('v*')` regressed heavily and was reverted.
+
+4. **Current status vs top solution**
+   - latest spot checks still show a gap to PR #203 on the 100M dataset.
