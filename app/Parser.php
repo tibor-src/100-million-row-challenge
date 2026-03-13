@@ -26,22 +26,46 @@ final class Parser
     public static function parse(string $inputPath, string $outputPath): void
     {
         gc_disable();
+        $profile = self::isProfileEnabled();
+        $parseStarted = hrtime(true);
 
         try {
+            $started = hrtime(true);
             [$dateStrings, $yearOffsets] = self::buildCalendar();
+            self::profileLog($profile, 'build_calendar_ms', self::elapsedMs($started));
+
+            $started = hrtime(true);
             $workerCount = self::resolveWorkerCount($inputPath);
+            self::profileLog($profile, 'resolve_workers_ms', self::elapsedMs($started));
 
             if ($workerCount > 1) {
-                [$paths, $counts] = self::aggregateMultiProcess($inputPath, $yearOffsets, count($dateStrings), $workerCount);
+                $started = hrtime(true);
+                [$paths, $counts] = self::aggregateMultiProcess($inputPath, $yearOffsets, count($dateStrings), $workerCount, $profile);
+                self::profileLog($profile, 'aggregate_multi_ms', self::elapsedMs($started));
+                $needsDateSort = false;
             } else {
+                $started = hrtime(true);
                 [$paths, $counts] = self::aggregateSingleProcess($inputPath, $yearOffsets);
+                self::profileLog($profile, 'aggregate_single_ms', self::elapsedMs($started));
+                $needsDateSort = true;
             }
 
-            self::writeJson($outputPath, $paths, $counts, $dateStrings);
+            $started = hrtime(true);
+            self::writeJson($outputPath, $paths, $counts, $dateStrings, $needsDateSort);
+            self::profileLog($profile, 'write_json_ms', self::elapsedMs($started));
         } catch (FastPathUnsupported) {
+            self::profileLog($profile, 'fast_path_fallback', 1.0);
+
+            $started = hrtime(true);
             [$paths, $counts] = self::aggregateGeneric($inputPath);
+            self::profileLog($profile, 'aggregate_generic_ms', self::elapsedMs($started));
+
+            $started = hrtime(true);
             self::writeJsonFromDateMaps($outputPath, $paths, $counts);
+            self::profileLog($profile, 'write_json_generic_ms', self::elapsedMs($started));
         }
+
+        self::profileLog($profile, 'total_parse_ms', self::elapsedMs($parseStarted));
     }
 
     private static function resolveWorkerCount(string $inputPath): int
@@ -115,10 +139,16 @@ final class Parser
     /**
      * @return array{0: list<string>, 1: array<int, array<int, int>>}
      */
-    private static function aggregateMultiProcess(string $inputPath, array $yearOffsets, int $dateCount, int $workerCount): array
+    private static function aggregateMultiProcess(string $inputPath, array $yearOffsets, int $dateCount, int $workerCount, bool $profile = false): array
     {
+        $started = hrtime(true);
         [$paths, $slugIndexes] = self::discoverPaths($inputPath);
+        self::profileLog($profile, 'multi_discover_paths_ms', self::elapsedMs($started));
+
+        $started = hrtime(true);
         $boundaries = self::calculateChunkBoundaries($inputPath, $workerCount);
+        self::profileLog($profile, 'multi_boundaries_ms', self::elapsedMs($started));
+
         $actualWorkers = count($boundaries) - 1;
         $mergeMode = self::resolveMergeMode();
 
@@ -167,18 +197,22 @@ final class Parser
         $buffers = [];
         $exitCodes = [];
 
+        $started = hrtime(true);
         foreach ($sockets as $pid => $socket) {
             $buffers[$pid] = self::readSocket($socket);
             fclose($socket);
             unset($sockets[$pid]);
         }
+        self::profileLog($profile, 'multi_read_sockets_ms', self::elapsedMs($started));
 
+        $started = hrtime(true);
         foreach ($pids as $pid) {
             $status = 0;
             pcntl_waitpid($pid, $status);
 
             $exitCodes[$pid] = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : 255;
         }
+        self::profileLog($profile, 'multi_wait_workers_ms', self::elapsedMs($started));
 
         foreach ($exitCodes as $pid => $exitCode) {
             if ($exitCode === 0) {
@@ -192,6 +226,7 @@ final class Parser
             throw new RuntimeException("Worker {$pid} exited abnormally");
         }
 
+        $started = hrtime(true);
         foreach ($buffers as $buffer) {
             if ($mergeMode === 'sodium') {
                 sodium_add($mergedBuffer, $buffer);
@@ -199,9 +234,12 @@ final class Parser
                 self::mergeWorkerBuffer($counts, $buffer, $dateCount);
             }
         }
+        self::profileLog($profile, 'multi_merge_buffers_ms', self::elapsedMs($started));
 
         if ($mergeMode === 'sodium') {
+            $started = hrtime(true);
             $counts = self::decodeDenseBuffer($mergedBuffer, count($paths), $dateCount);
+            self::profileLog($profile, 'multi_decode_dense_ms', self::elapsedMs($started));
         }
 
         return [$paths, $counts];
@@ -821,7 +859,7 @@ final class Parser
      * @param array<int, array<int, int>> $counts
      * @param list<string> $dateStrings
      */
-    private static function writeJson(string $outputPath, array $paths, array $counts, array $dateStrings): void
+    private static function writeJson(string $outputPath, array $paths, array $counts, array $dateStrings, bool $needsDateSort): void
     {
         $handle = fopen($outputPath, 'wb');
 
@@ -840,7 +878,9 @@ final class Parser
                 continue;
             }
 
-            ksort($counts[$pathIndex]);
+            if ($needsDateSort) {
+                ksort($counts[$pathIndex]);
+            }
 
             fwrite($handle, $firstPath ? "\n" : ",\n");
             fwrite($handle, '    ' . self::encodePath($path) . ': {');
@@ -909,6 +949,27 @@ final class Parser
         static $encoded = [];
 
         return $encoded[$path] ??= '"' . str_replace('/', '\\/', $path) . '"';
+    }
+
+    private static function isProfileEnabled(): bool
+    {
+        $value = getenv('TEMPEST_PARSER_PROFILE');
+
+        return $value !== false && $value !== '' && $value !== '0';
+    }
+
+    private static function elapsedMs(int $started): float
+    {
+        return (hrtime(true) - $started) / 1_000_000;
+    }
+
+    private static function profileLog(bool $enabled, string $name, float $value): void
+    {
+        if (! $enabled) {
+            return;
+        }
+
+        fwrite(STDERR, sprintf("[parser-profile] %s=%.3f\n", $name, $value));
     }
 }
 
