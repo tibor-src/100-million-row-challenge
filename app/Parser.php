@@ -418,12 +418,21 @@ final class Parser
     ): never {
         try {
             $buffer = str_repeat("\0", count($slugIndexes) * $dateCount * self::WORKER_COUNTER_BYTES);
+            $nextBytes = self::byteLookup();
+            $unrollFactor = self::resolveUnrollFactor();
+            $handle = fopen($inputPath, 'rb');
+
+            if ($handle === false) {
+                throw new RuntimeException("Unable to open input file: {$inputPath}");
+            }
+
+            stream_set_read_buffer($handle, 0);
 
             for ($chunkIndex = $workerIndex; $chunkIndex < count($chunkRanges); $chunkIndex += $workerCount) {
                 [$start, $end] = $chunkRanges[$chunkIndex];
 
                 self::parseChunk(
-                    $inputPath,
+                    $handle,
                     $start,
                     $end,
                     $slugIndexes,
@@ -436,9 +445,13 @@ final class Parser
                     $dateCount,
                     $trustFastPath,
                     $readChunkBytes,
+                    $nextBytes,
+                    $unrollFactor,
                     $buffer,
                 );
             }
+
+            fclose($handle);
 
             if ($mergeMode === 'sodium') {
                 self::writeSocket($socket, chunk_split($buffer, 1, "\0"));
@@ -468,7 +481,7 @@ final class Parser
      * @param array<string, int> $slugIndexes
      */
     private static function parseChunk(
-        string $inputPath,
+        mixed $handle,
         int $start,
         int $end,
         array $slugIndexes,
@@ -481,19 +494,13 @@ final class Parser
         int $dateCount,
         bool $trustFastPath,
         int $readChunkBytes,
+        array $nextBytes,
+        int $unrollFactor,
         string &$buffer,
     ): void {
-        $handle = fopen($inputPath, 'rb');
-
-        if ($handle === false) {
-            throw new RuntimeException("Unable to open input file: {$inputPath}");
-        }
-
-        stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
 
         $remaining = $end - $start;
-        $nextBytes = self::byteLookup();
 
         if ($packedTailMap !== []) {
             while ($remaining > 0) {
@@ -538,13 +545,10 @@ final class Parser
                 );
             }
 
-            fclose($handle);
-
             return;
         }
 
         $carry = '';
-        $unrollFactor = self::resolveUnrollFactor();
 
         while ($remaining > 0) {
             $chunk = fread($handle, min($readChunkBytes, $remaining));
@@ -581,8 +585,6 @@ final class Parser
         if ($carry !== '') {
             self::consumeBuffer($carry, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
         }
-
-        fclose($handle);
     }
 
     /**
