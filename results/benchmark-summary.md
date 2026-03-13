@@ -558,3 +558,34 @@ Iteration-10 head-to-head batches versus PR #203 were mixed:
 - another 3-run batch favored PR #203
 
 Conclusion: no stable overtake yet; continue with further targeted experiments.
+
+## Iteration 11 — multi-version experiment loop with 5x stability gates
+
+This pass followed a stricter versioning workflow:
+
+- each meaningful parser variant was committed and pushed
+- each retained/rejected direction used repeated runs (primarily 5x) for stability
+- all changes were checked in single-core and multi-core modes
+
+### Version chain tested
+
+1. shared worker file-handle parsing (`dae06b7`) — regression
+2. split packed/generic chunk functions (`57e2a5c`) — regression
+3. revert recovery (`086c567`) — recovered baseline
+4. assume-challenge-shape toggle (`e15ff2a`) — mixed results, not retained as default
+5. worker socket write fast-path (`83bf560`) — small but inconsistent gain
+6. split safe/trusted packed consumers (`8b36d6b`) — regression, reverted by `e90e635`
+
+### Stable findings from this pass
+
+- `workers=8` remained best in current environment among tested worker counts
+- sodium merge continued to beat manual merge
+- select-based socket reading continued to beat sequential draining
+- assume-shape mode did not provide stable cross-run improvement for single/multi defaults
+
+### Latest 5x head-to-head snapshot (same-run window)
+
+- current branch (tuned): **3.019s median**
+- PR #203: **2.890s median**
+
+Gap remains ~0.13s median in this window.
