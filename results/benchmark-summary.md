@@ -309,3 +309,47 @@ Even with that aggressive mode, local median still trailed PR #203.
   - a further parser architecture shift (e.g. specialized packed lookup + lower-overhead work distribution tailored to this host).
 
 Given all tested PHP-only variants in this pass, no additional retained change produced a clear win over the current best safe default configuration.
+
+## Iteration 6 — compliance-first entrypoint + host-aware defaults
+
+- **Compliance commit:** `3c3584b44dd20f18f4f0b5b04d55d48c308499c2`
+- **Host-aware commit:** `36fc2a6c571a9520da67984fd5f7228c1558efb3`
+- **Status:** validation passing, output hash unchanged
+
+### Compliance change applied
+
+The `tempest` bootstrap bypass for `data:parse` was removed so parser execution now goes through the standard command entry path. This aligns with the stricter interpretation requested in follow-up notes.
+
+### Host-aware strategy now used
+
+Parser defaults now adapt to host/input characteristics:
+
+1. worker count uses detected CPU count and file-size thresholds (with caps)
+2. chunk target size is derived from file size and active worker count
+3. read chunk size adapts by file-size tier
+4. trust-fast-path default is enabled only for very large files (and remains overridable)
+
+### Full-size results after compliance + host-aware pass
+
+| Mode | Median / observed |
+|------|--------------------|
+| host-aware default (100M) | 3.195s median (3 runs) |
+| explicit tuned config (100M) | 3.174s median (3 runs) |
+| profiled default wall time (100M) | 3.547s |
+
+### What still dominates
+
+Profiling still shows worker parsing time as the largest cost center. JSON writing is now comparatively small.
+
+### Relative to top-3 upstream
+
+Under the no-bypass compliance path:
+
+- we are still behind the local PR #203 median
+- and slower than the local PR #3 median as well
+
+So the compliance decision trades away some absolute speed versus the earlier bypass-enabled comparisons.
+
+### Further gains attempted in this pass
+
+After host-aware adoption, additional parameter sweeps (merge/worker/chunk settings) produced only marginal changes and no clear structural win.
