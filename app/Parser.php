@@ -16,8 +16,13 @@ final class Parser
     private const int DEFAULT_WORKERS = 8;
     private const int MULTI_PROCESS_THRESHOLD_BYTES = 134_217_728;
     private const int DISCOVERY_IDLE_BYTES = 1_048_576;
+    private const int CHUNK_TARGET_BYTES = 8_388_608;
     private const int READ_CHUNK_BYTES = 131_072;
-    private const int COUNTER_BYTES = 2;
+    private const int WORKER_COUNTER_BYTES = 1;
+    private const int MERGED_COUNTER_BYTES = 2;
+    private const int PACKED_INDEX_BITS = 21;
+    private const int PACKED_INDEX_MASK = (1 << self::PACKED_INDEX_BITS) - 1;
+    private const int PACKED_UNROLL = 10;
     private const string DEFAULT_MERGE_MODE = 'sodium';
     private const int DEFAULT_UNROLL = 1;
     private const array MONTH_OFFSETS = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
@@ -33,6 +38,7 @@ final class Parser
             $started = hrtime(true);
             [$dateStrings, $yearOffsets] = self::buildCalendar();
             self::profileLog($profile, 'build_calendar_ms', self::elapsedMs($started));
+            $dateIdsShort = self::buildShortDateIds($dateStrings);
 
             $started = hrtime(true);
             $workerCount = self::resolveWorkerCount($inputPath);
@@ -40,7 +46,7 @@ final class Parser
 
             if ($workerCount > 1) {
                 $started = hrtime(true);
-                [$paths, $counts] = self::aggregateMultiProcess($inputPath, $yearOffsets, count($dateStrings), $workerCount, $profile);
+                [$paths, $counts] = self::aggregateMultiProcess($inputPath, $yearOffsets, $dateIdsShort, count($dateStrings), $workerCount, $profile);
                 self::profileLog($profile, 'aggregate_multi_ms', self::elapsedMs($started));
                 $needsDateSort = false;
             } else {
@@ -139,20 +145,30 @@ final class Parser
     /**
      * @return array{0: list<string>, 1: array<int, array<int, int>>}
      */
-    private static function aggregateMultiProcess(string $inputPath, array $yearOffsets, int $dateCount, int $workerCount, bool $profile = false): array
+    private static function aggregateMultiProcess(
+        string $inputPath,
+        array $yearOffsets,
+        array $dateIdsShort,
+        int $dateCount,
+        int $workerCount,
+        bool $profile = false,
+    ): array
     {
         $started = hrtime(true);
         [$paths, $slugIndexes] = self::discoverPaths($inputPath);
         self::profileLog($profile, 'multi_discover_paths_ms', self::elapsedMs($started));
 
         $started = hrtime(true);
-        $boundaries = self::calculateChunkBoundaries($inputPath, $workerCount);
+        [$packedTailMap, $tailLength, $tailOffset, $fence] = self::buildPackedTailMap($paths, $dateCount);
+        self::profileLog($profile, 'multi_build_tail_map_ms', self::elapsedMs($started));
+
+        $started = hrtime(true);
+        $chunkRanges = self::calculateChunkRanges($inputPath);
         self::profileLog($profile, 'multi_boundaries_ms', self::elapsedMs($started));
-
-        $actualWorkers = count($boundaries) - 1;
         $mergeMode = self::resolveMergeMode();
+        $actualWorkers = min($workerCount, count($chunkRanges));
 
-        if ($actualWorkers <= 1) {
+        if (count($chunkRanges) <= 1 || $actualWorkers <= 1) {
             return self::aggregateSingleProcess($inputPath, $yearOffsets);
         }
 
@@ -176,10 +192,17 @@ final class Parser
                 fclose($pair[0]);
                 self::runWorker(
                     $inputPath,
-                    $boundaries[$workerIndex],
-                    $boundaries[$workerIndex + 1],
+                    $chunkRanges,
+                    $workerIndex,
+                    $actualWorkers,
                     $slugIndexes,
                     $yearOffsets,
+                    $dateIdsShort,
+                    $packedTailMap,
+                    $tailLength,
+                    $tailOffset,
+                    $fence,
+                    $mergeMode,
                     $dateCount,
                     $pair[1],
                 );
@@ -192,7 +215,7 @@ final class Parser
 
         $counts = array_fill(0, count($paths), []);
         $mergedBuffer = $mergeMode === 'sodium'
-            ? str_repeat("\0", count($paths) * $dateCount * self::COUNTER_BYTES)
+            ? str_repeat("\0", count($paths) * $dateCount * self::MERGED_COUNTER_BYTES)
             : null;
         $buffers = [];
         $exitCodes = [];
@@ -294,9 +317,9 @@ final class Parser
     }
 
     /**
-     * @return list<int>
+     * @return list<array{0: int, 1: int}>
      */
-    private static function calculateChunkBoundaries(string $inputPath, int $workerCount): array
+    private static function calculateChunkRanges(string $inputPath): array
     {
         $handle = fopen($inputPath, 'rb');
 
@@ -313,34 +336,27 @@ final class Parser
             throw new RuntimeException("Unable to determine file size: {$inputPath}");
         }
 
-        $boundaries = [0];
-        $step = (int) floor($fileSize / $workerCount);
+        $chunkTarget = self::resolveChunkTargetBytes();
+        $ranges = [];
+        $start = 0;
 
-        for ($workerIndex = 1; $workerIndex < $workerCount; $workerIndex++) {
-            $offset = $step * $workerIndex;
+        while ($start < $fileSize) {
+            $end = min($start + $chunkTarget, $fileSize);
 
-            if ($offset <= 0 || $offset >= $fileSize) {
-                continue;
+            if ($end < $fileSize) {
+                fseek($handle, $end);
+                fgets($handle);
+                $aligned = ftell($handle);
+                $end = ($aligned === false || $aligned <= $start) ? $fileSize : $aligned;
             }
 
-            fseek($handle, $offset);
-            fgets($handle);
-
-            $boundary = ftell($handle);
-
-            if ($boundary === false || $boundary >= $fileSize) {
-                continue;
-            }
-
-            if ($boundary > $boundaries[array_key_last($boundaries)]) {
-                $boundaries[] = $boundary;
-            }
+            $ranges[] = [$start, $end];
+            $start = $end;
         }
 
-        $boundaries[] = $fileSize;
         fclose($handle);
 
-        return $boundaries;
+        return $ranges;
     }
 
     /**
@@ -348,16 +364,49 @@ final class Parser
      */
     private static function runWorker(
         string $inputPath,
-        int $start,
-        int $end,
+        array $chunkRanges,
+        int $workerIndex,
+        int $workerCount,
         array $slugIndexes,
         array $yearOffsets,
+        array $dateIdsShort,
+        array $packedTailMap,
+        int $tailLength,
+        int $tailOffset,
+        int $fence,
+        string $mergeMode,
         int $dateCount,
         mixed $socket,
     ): never {
         try {
-            $buffer = self::parseChunk($inputPath, $start, $end, $slugIndexes, $yearOffsets, $dateCount);
-            self::writeSocket($socket, $buffer);
+            $buffer = str_repeat("\0", count($slugIndexes) * $dateCount * self::WORKER_COUNTER_BYTES);
+            $trustFastPath = self::resolveTrustFastPath();
+
+            for ($chunkIndex = $workerIndex; $chunkIndex < count($chunkRanges); $chunkIndex += $workerCount) {
+                [$start, $end] = $chunkRanges[$chunkIndex];
+
+                self::parseChunk(
+                    $inputPath,
+                    $start,
+                    $end,
+                    $slugIndexes,
+                    $yearOffsets,
+                    $dateIdsShort,
+                    $packedTailMap,
+                    $tailLength,
+                    $tailOffset,
+                    $fence,
+                    $dateCount,
+                    $trustFastPath,
+                    $buffer,
+                );
+            }
+
+            if ($mergeMode === 'sodium') {
+                self::writeSocket($socket, chunk_split($buffer, 1, "\0"));
+            } else {
+                self::writeSocket($socket, $buffer);
+            }
             fclose($socket);
             exit(0);
         } catch (FastPathUnsupported) {
@@ -386,8 +435,15 @@ final class Parser
         int $end,
         array $slugIndexes,
         array $yearOffsets,
+        array $dateIdsShort,
+        array $packedTailMap,
+        int $tailLength,
+        int $tailOffset,
+        int $fence,
         int $dateCount,
-    ): string {
+        bool $trustFastPath,
+        string &$buffer,
+    ): void {
         $handle = fopen($inputPath, 'rb');
 
         if ($handle === false) {
@@ -397,7 +453,6 @@ final class Parser
         stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
 
-        $buffer = str_repeat("\0", count($slugIndexes) * $dateCount * self::COUNTER_BYTES);
         $remaining = $end - $start;
         $carry = '';
         $nextBytes = self::byteLookup();
@@ -433,16 +488,44 @@ final class Parser
                 $carry = '';
             }
 
-            self::consumeBuffer($data, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
+            if ($packedTailMap !== []) {
+                self::consumePackedBuffer(
+                    $data,
+                    $buffer,
+                    $packedTailMap,
+                    $dateIdsShort,
+                    $nextBytes,
+                    $tailLength,
+                    $tailOffset,
+                    $fence,
+                    $dateCount,
+                    $trustFastPath,
+                );
+            } else {
+                self::consumeBuffer($data, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
+            }
         }
 
         if ($carry !== '') {
-            self::consumeBuffer($carry, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
+            if ($packedTailMap !== []) {
+                self::consumePackedBuffer(
+                    $carry . "\n",
+                    $buffer,
+                    $packedTailMap,
+                    $dateIdsShort,
+                    $nextBytes,
+                    $tailLength,
+                    $tailOffset,
+                    $fence,
+                    $dateCount,
+                    $trustFastPath,
+                );
+            } else {
+                self::consumeBuffer($carry, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
+            }
         }
 
         fclose($handle);
-
-        return $buffer;
     }
 
     /**
@@ -481,22 +564,14 @@ final class Parser
             }
 
             $dateIndex = self::dateIndexFromLine($data, $comma, $yearOffsets);
-            $counterOffset = (($pathIndex * $dateCount) + $dateIndex) * self::COUNTER_BYTES;
-            $lowByte = ord($countsBuffer[$counterOffset]);
+            $counterOffset = (($pathIndex * $dateCount) + $dateIndex);
+            $current = $countsBuffer[$counterOffset];
 
-            if ($lowByte !== 255) {
-                $countsBuffer[$counterOffset] = $nextBytes[$lowByte];
-            } else {
-                $countsBuffer[$counterOffset] = "\0";
-                $highOffset = $counterOffset + 1;
-                $highByte = ord($countsBuffer[$highOffset]);
-
-                if ($highByte === 255) {
-                    throw new FastPathUnsupported('Counter overflowed 16-bit storage');
-                }
-
-                $countsBuffer[$highOffset] = $nextBytes[$highByte];
+            if ($current === "\xFF") {
+                throw new FastPathUnsupported('Counter overflowed 8-bit worker storage');
             }
+
+            $countsBuffer[$counterOffset] = $nextBytes[$current];
 
             $lineStart = isset($data[$comma + self::LINE_SUFFIX_LENGTH - 1]) && $data[$comma + self::LINE_SUFFIX_LENGTH - 1] === "\n"
                 ? $comma + self::LINE_SUFFIX_LENGTH
@@ -534,22 +609,14 @@ final class Parser
             }
 
             $dateIndex = self::dateIndexFromLine($data, $comma, $yearOffsets);
-            $counterOffset = (($pathIndex * $dateCount) + $dateIndex) * self::COUNTER_BYTES;
-            $lowByte = ord($countsBuffer[$counterOffset]);
+            $counterOffset = (($pathIndex * $dateCount) + $dateIndex);
+            $current = $countsBuffer[$counterOffset];
 
-            if ($lowByte !== 255) {
-                $countsBuffer[$counterOffset] = $nextBytes[$lowByte];
-            } else {
-                $countsBuffer[$counterOffset] = "\0";
-                $highOffset = $counterOffset + 1;
-                $highByte = ord($countsBuffer[$highOffset]);
-
-                if ($highByte === 255) {
-                    throw new FastPathUnsupported('Counter overflowed 16-bit storage');
-                }
-
-                $countsBuffer[$highOffset] = $nextBytes[$highByte];
+            if ($current === "\xFF") {
+                throw new FastPathUnsupported('Counter overflowed 8-bit worker storage');
             }
+
+            $countsBuffer[$counterOffset] = $nextBytes[$current];
 
             $lineStart = isset($data[$comma + self::LINE_SUFFIX_LENGTH - 1]) && $data[$comma + self::LINE_SUFFIX_LENGTH - 1] === "\n"
                 ? $comma + self::LINE_SUFFIX_LENGTH
@@ -569,26 +636,18 @@ final class Parser
             $pathIndex = $slugIndexes[$slug] ?? null;
 
             if ($pathIndex === null) {
-                throw new RuntimeException("Encountered undiscovered slug: {$slug}");
+                throw new FastPathUnsupported("Encountered undiscovered slug: {$slug}");
             }
 
             $dateIndex = self::dateIndexFromLine($data, $comma, $yearOffsets);
-            $counterOffset = (($pathIndex * $dateCount) + $dateIndex) * self::COUNTER_BYTES;
-            $lowByte = ord($countsBuffer[$counterOffset]);
+            $counterOffset = (($pathIndex * $dateCount) + $dateIndex);
+            $current = $countsBuffer[$counterOffset];
 
-            if ($lowByte !== 255) {
-                $countsBuffer[$counterOffset] = $nextBytes[$lowByte];
-            } else {
-                $countsBuffer[$counterOffset] = "\0";
-                $highOffset = $counterOffset + 1;
-                $highByte = ord($countsBuffer[$highOffset]);
-
-                if ($highByte === 255) {
-                    throw new RuntimeException('Counter overflowed 16-bit storage');
-                }
-
-                $countsBuffer[$highOffset] = $nextBytes[$highByte];
+            if ($current === "\xFF") {
+                throw new FastPathUnsupported('Counter overflowed 8-bit worker storage');
             }
+
+            $countsBuffer[$counterOffset] = $nextBytes[$current];
 
             $lineStart = isset($data[$comma + self::LINE_SUFFIX_LENGTH - 1]) && $data[$comma + self::LINE_SUFFIX_LENGTH - 1] === "\n"
                 ? $comma + self::LINE_SUFFIX_LENGTH
@@ -597,15 +656,132 @@ final class Parser
     }
 
     /**
+     * @param array<string, int> $packedTailMap
+     * @param array<string, int> $dateIdsShort
+     * @param list<string> $nextBytes
+     */
+    private static function consumePackedBuffer(
+        string $data,
+        string &$countsBuffer,
+        array $packedTailMap,
+        array $dateIdsShort,
+        array $nextBytes,
+        int $tailLength,
+        int $tailOffset,
+        int $fence,
+        int $dateCount,
+        bool $trustFastPath,
+    ): void {
+        if ($trustFastPath) {
+            self::consumePackedBufferTrusted($data, $countsBuffer, $packedTailMap, $dateIdsShort, $nextBytes, $tailLength, $tailOffset, $fence);
+            return;
+        }
+
+        $pointer = strlen($data) - 1;
+        $mask = self::PACKED_INDEX_MASK;
+        $shift = self::PACKED_INDEX_BITS;
+
+        while ($pointer > $fence) {
+            for ($i = 0; $i < self::PACKED_UNROLL; $i++) {
+                $packed = $packedTailMap[substr($data, $pointer - $tailOffset, $tailLength)] ?? null;
+
+                if ($packed === null) {
+                    throw new FastPathUnsupported('Encountered undiscovered URI tail in packed parser');
+                }
+
+                $dateId = $dateIdsShort[substr($data, $pointer - 22, 7)] ?? null;
+
+                if ($dateId === null || $dateId >= $dateCount) {
+                    throw new FastPathUnsupported('Encountered unsupported date in packed parser');
+                }
+
+                $counterOffset = (($packed & $mask) + $dateId);
+                $current = $countsBuffer[$counterOffset];
+
+                if ($current === "\xFF") {
+                    throw new FastPathUnsupported('Counter overflowed 8-bit worker storage');
+                }
+
+                $countsBuffer[$counterOffset] = $nextBytes[$current];
+
+                $pointer -= $packed >> $shift;
+            }
+        }
+
+        while ($pointer >= $tailOffset) {
+            $packed = $packedTailMap[substr($data, $pointer - $tailOffset, $tailLength)] ?? null;
+
+            if ($packed === null) {
+                throw new FastPathUnsupported('Encountered undiscovered URI tail in packed parser');
+            }
+
+            $dateId = $dateIdsShort[substr($data, $pointer - 22, 7)] ?? null;
+
+            if ($dateId === null || $dateId >= $dateCount) {
+                throw new FastPathUnsupported('Encountered unsupported date in packed parser');
+            }
+
+            $counterOffset = (($packed & $mask) + $dateId);
+            $current = $countsBuffer[$counterOffset];
+
+            if ($current === "\xFF") {
+                throw new FastPathUnsupported('Counter overflowed 8-bit worker storage');
+            }
+
+            $countsBuffer[$counterOffset] = $nextBytes[$current];
+
+            $pointer -= $packed >> $shift;
+        }
+    }
+
+    /**
+     * @param array<string, int> $packedTailMap
+     * @param array<string, int> $dateIdsShort
+     * @param list<string> $nextBytes
+     */
+    private static function consumePackedBufferTrusted(
+        string $data,
+        string &$countsBuffer,
+        array $packedTailMap,
+        array $dateIdsShort,
+        array $nextBytes,
+        int $tailLength,
+        int $tailOffset,
+        int $fence,
+    ): void {
+        $pointer = strlen($data) - 1;
+        $mask = self::PACKED_INDEX_MASK;
+        $shift = self::PACKED_INDEX_BITS;
+
+        while ($pointer > $fence) {
+            for ($i = 0; $i < self::PACKED_UNROLL; $i++) {
+                $packed = $packedTailMap[substr($data, $pointer - $tailOffset, $tailLength)];
+                $dateId = $dateIdsShort[substr($data, $pointer - 22, 7)];
+                $counterOffset = (($packed & $mask) + $dateId);
+                $countsBuffer[$counterOffset] = $nextBytes[$countsBuffer[$counterOffset]];
+                $pointer -= $packed >> $shift;
+            }
+        }
+
+        while ($pointer >= $tailOffset) {
+            $packed = $packedTailMap[substr($data, $pointer - $tailOffset, $tailLength)];
+            $dateId = $dateIdsShort[substr($data, $pointer - 22, 7)];
+            $counterOffset = (($packed & $mask) + $dateId);
+            $countsBuffer[$counterOffset] = $nextBytes[$countsBuffer[$counterOffset]];
+            $pointer -= $packed >> $shift;
+        }
+    }
+
+    /**
      * @param array<int, array<int, int>> $counts
      */
     private static function mergeWorkerBuffer(array &$counts, string $buffer, int $dateCount): void
     {
-        $byteOffset = 0;
+        $offset = 0;
 
         foreach ($counts as $pathIndex => &$pathCounts) {
-            for ($dateIndex = 0; $dateIndex < $dateCount; $dateIndex++, $byteOffset += self::COUNTER_BYTES) {
-                $value = ord($buffer[$byteOffset]) | (ord($buffer[$byteOffset + 1]) << 8);
+            for ($dateIndex = 0; $dateIndex < $dateCount; $dateIndex++, $offset++) {
+                $value = ord($buffer[$offset]);
 
                 if ($value === 0) {
                     continue;
@@ -631,7 +807,7 @@ final class Parser
         $byteOffset = 0;
 
         foreach ($counts as &$pathCounts) {
-            for ($dateIndex = 0; $dateIndex < $dateCount; $dateIndex++, $byteOffset += self::COUNTER_BYTES) {
+            for ($dateIndex = 0; $dateIndex < $dateCount; $dateIndex++, $byteOffset += self::MERGED_COUNTER_BYTES) {
                 $value = ord($buffer[$byteOffset]) | (ord($buffer[$byteOffset + 1]) << 8);
 
                 if ($value !== 0) {
@@ -659,7 +835,7 @@ final class Parser
         $lookup = [];
 
         for ($byte = 0; $byte < 256; $byte++) {
-            $lookup[$byte] = chr(($byte + 1) & 255);
+            $lookup[chr($byte)] = chr(($byte + 1) & 255);
         }
 
         return $lookup;
@@ -724,6 +900,24 @@ final class Parser
         return self::DISCOVERY_IDLE_BYTES;
     }
 
+    private static function resolveChunkTargetBytes(): int
+    {
+        $configured = getenv('TEMPEST_PARSER_CHUNK_TARGET_BYTES');
+
+        if ($configured !== false && $configured !== '') {
+            return max(1_048_576, (int) $configured);
+        }
+
+        return self::CHUNK_TARGET_BYTES;
+    }
+
+    private static function resolveTrustFastPath(): bool
+    {
+        $configured = getenv('TEMPEST_PARSER_TRUST_FAST_PATH');
+
+        return $configured !== false && $configured !== '' && $configured !== '0';
+    }
+
     private static function resolveMergeMode(): string
     {
         $configured = getenv('TEMPEST_PARSER_MERGE');
@@ -750,6 +944,78 @@ final class Parser
         }
 
         return self::DEFAULT_UNROLL;
+    }
+
+    /**
+     * @param list<string> $dateStrings
+     * @return array<string, int>
+     */
+    private static function buildShortDateIds(array $dateStrings): array
+    {
+        $dateIdsShort = [];
+
+        foreach ($dateStrings as $dateId => $date) {
+            $dateIdsShort[substr($date, 3, 7)] = $dateId;
+        }
+
+        return $dateIdsShort;
+    }
+
+    /**
+     * @param list<string> $paths
+     * @return array{0: array<string, int>, 1: int, 2: int, 3: int}
+     */
+    private static function buildPackedTailMap(array $paths, int $dateCount): array
+    {
+        if ($paths === []) {
+            return [[], 22, 48, 0];
+        }
+
+        $fullUris = [];
+
+        foreach ($paths as $path) {
+            $fullUris[] = 'https://stitcher.io' . $path;
+        }
+
+        $tailLength = 22;
+
+        while (true) {
+            $seen = [];
+            $collision = false;
+
+            foreach ($fullUris as $uri) {
+                $tail = substr($uri, -$tailLength);
+
+                if (isset($seen[$tail])) {
+                    $collision = true;
+                    break;
+                }
+
+                $seen[$tail] = true;
+            }
+
+            if (! $collision) {
+                break;
+            }
+
+            $tailLength++;
+        }
+
+        $packedTailMap = [];
+        $maxStride = 0;
+
+        foreach ($paths as $pathIndex => $path) {
+            $stride = strlen($path) + 46;
+            $maxStride = max($maxStride, $stride);
+            $baseIndex = $pathIndex * $dateCount;
+            $tail = substr($fullUris[$pathIndex], -$tailLength);
+            $packedTailMap[$tail] = ($stride << self::PACKED_INDEX_BITS) | $baseIndex;
+        }
+
+        $tailOffset = 26 + $tailLength;
+        $fence = ($maxStride * self::PACKED_UNROLL) + $tailOffset;
+
+        return [$packedTailMap, $tailLength, $tailOffset, $fence];
     }
 
     private static function dateIndexFromLine(string $line, int $comma, array $yearOffsets): int
@@ -868,8 +1134,7 @@ final class Parser
         }
 
         stream_set_write_buffer($handle, 1_048_576);
-
-        fwrite($handle, '{');
+        $buffer = '{';
 
         $firstPath = true;
 
@@ -882,22 +1147,28 @@ final class Parser
                 ksort($counts[$pathIndex]);
             }
 
-            fwrite($handle, $firstPath ? "\n" : ",\n");
-            fwrite($handle, '    ' . self::encodePath($path) . ': {');
+            $buffer .= $firstPath ? "\n" : ",\n";
+            $buffer .= '    ' . self::encodePath($path) . ': {';
 
             $firstDate = true;
 
             foreach ($counts[$pathIndex] as $dateIndex => $count) {
-                fwrite($handle, $firstDate ? "\n" : ",\n");
-                fwrite($handle, '        "' . $dateStrings[$dateIndex] . '": ' . $count);
+                $buffer .= $firstDate ? "\n" : ",\n";
+                $buffer .= '        "' . $dateStrings[$dateIndex] . '": ' . $count;
                 $firstDate = false;
             }
 
-            fwrite($handle, "\n    }");
+            $buffer .= "\n    }";
             $firstPath = false;
+
+            if (strlen($buffer) >= 2_097_152) {
+                fwrite($handle, $buffer);
+                $buffer = '';
+            }
         }
 
-        fwrite($handle, $firstPath ? '}' : "\n}");
+        $buffer .= $firstPath ? '}' : "\n}";
+        fwrite($handle, $buffer);
         fclose($handle);
     }
 
@@ -914,8 +1185,7 @@ final class Parser
         }
 
         stream_set_write_buffer($handle, 1_048_576);
-
-        fwrite($handle, '{');
+        $buffer = '{';
         $firstPath = true;
 
         foreach ($paths as $pathIndex => $path) {
@@ -925,22 +1195,28 @@ final class Parser
 
             ksort($counts[$pathIndex]);
 
-            fwrite($handle, $firstPath ? "\n" : ",\n");
-            fwrite($handle, '    ' . self::encodePath($path) . ': {');
+            $buffer .= $firstPath ? "\n" : ",\n";
+            $buffer .= '    ' . self::encodePath($path) . ': {';
 
             $firstDate = true;
 
             foreach ($counts[$pathIndex] as $date => $count) {
-                fwrite($handle, $firstDate ? "\n" : ",\n");
-                fwrite($handle, '        "' . $date . '": ' . $count);
+                $buffer .= $firstDate ? "\n" : ",\n";
+                $buffer .= '        "' . $date . '": ' . $count;
                 $firstDate = false;
             }
 
-            fwrite($handle, "\n    }");
+            $buffer .= "\n    }";
             $firstPath = false;
+
+            if (strlen($buffer) >= 2_097_152) {
+                fwrite($handle, $buffer);
+                $buffer = '';
+            }
         }
 
-        fwrite($handle, $firstPath ? '}' : "\n}");
+        $buffer .= $firstPath ? '}' : "\n}";
+        fwrite($handle, $buffer);
         fclose($handle);
     }
 
