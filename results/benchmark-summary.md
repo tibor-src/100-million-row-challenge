@@ -46,3 +46,49 @@ This baseline is intentionally recorded as the starting point requested in the P
 ### Next target
 
 Introduce the multi-process parsing path, benchmark single-core vs multi-core, and then iterate on merge/output performance.
+
+## Iteration 2 — adaptive multi-process parser
+
+- **Commit:** `3c3c24c28cfaf1ff6c7db4b69f2c7d559732ac16`
+- **Status:** validation passing
+- **Implementation notes:**
+  - added chunked multi-process parsing with `pcntl_fork()`
+  - used UNIX socket pairs for worker → parent buffer transfer
+  - added dense 16-bit counter buffers in worker processes
+  - switched final output generation to a manual pretty JSON writer
+  - kept an adaptive threshold so small inputs stay single-process while large inputs switch to multi-process automatically
+
+### Validation and parity
+
+- `php tempest data:validate` → **PASS** in `0.005252123s`
+- forced `TEMPEST_PARSER_WORKERS=8` on `data/test-data.csv` matched the expected JSON exactly
+- 1M dataset: single-worker and multi-worker outputs matched byte-for-byte
+- 10M dataset: single-worker and 4-worker outputs matched byte-for-byte
+
+### 1M development dataset comparison
+
+Forced worker counts:
+
+| Workers | Median / observed time |
+|---------|-------------------------|
+| 1 | 1.096921s |
+| 4 | 0.887613s |
+| 6 | 0.937956s |
+| 8 | 0.995030s |
+
+Observation: on the smaller 1M dataset, worker coordination overhead means 4 workers beat 8 workers locally.
+
+### 10M development dataset comparison
+
+| Workers | Time |
+|---------|------|
+| 1 | 6.084797s |
+| 4 | 1.938152s |
+| 8 | 1.927250s |
+| auto | 1.930535s |
+
+Observation: on the 10M dataset, 8 workers narrowly beat 4 workers and delivered a **3.16x speedup** over single-worker mode.
+
+### Adaptive decision
+
+The parser now stays single-process for inputs below `128MB` and switches to multi-process above that threshold. This preserves low-overhead behavior on small datasets while still enabling strong multi-core scaling on larger inputs.
