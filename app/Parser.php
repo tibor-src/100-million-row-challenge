@@ -964,11 +964,15 @@ final class Parser
 
     private static function writeSocket(mixed $socket, string $buffer): void
     {
-        $written = 0;
         $length = strlen($buffer);
+        $written = fwrite($socket, $buffer);
+
+        if ($written === false || $written === 0) {
+            throw new RuntimeException('Unable to write worker buffer to socket');
+        }
 
         while ($written < $length) {
-            $chunk = fwrite($socket, substr($buffer, $written, 65_536));
+            $chunk = fwrite($socket, substr($buffer, $written));
 
             if ($chunk === false || $chunk === 0) {
                 throw new RuntimeException('Unable to write worker buffer to socket');
