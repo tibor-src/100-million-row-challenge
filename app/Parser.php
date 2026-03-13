@@ -7,7 +7,6 @@ use Throwable;
 
 final class Parser
 {
-    private const int EXPECTED_PATH_COUNT = 268;
     private const int PATH_OFFSET = 19;
     private const int URL_PREFIX_LENGTH = 25;
     private const int TIMESTAMP_LENGTH = 25;
@@ -16,6 +15,7 @@ final class Parser
     private const int DATE_END_YEAR = 2026;
     private const int DEFAULT_WORKERS = 8;
     private const int MULTI_PROCESS_THRESHOLD_BYTES = 134_217_728;
+    private const int DISCOVERY_IDLE_BYTES = 1_048_576;
     private const int READ_CHUNK_BYTES = 131_072;
     private const int COUNTER_BYTES = 2;
     private const string DEFAULT_MERGE_MODE = 'sodium';
@@ -27,16 +27,21 @@ final class Parser
     {
         gc_disable();
 
-        [$dateStrings, $yearOffsets] = self::buildCalendar();
-        $workerCount = self::resolveWorkerCount($inputPath);
+        try {
+            [$dateStrings, $yearOffsets] = self::buildCalendar();
+            $workerCount = self::resolveWorkerCount($inputPath);
 
-        if ($workerCount > 1) {
-            [$paths, $counts] = self::aggregateMultiProcess($inputPath, $yearOffsets, count($dateStrings), $workerCount);
-        } else {
-            [$paths, $counts] = self::aggregateSingleProcess($inputPath, $yearOffsets);
+            if ($workerCount > 1) {
+                [$paths, $counts] = self::aggregateMultiProcess($inputPath, $yearOffsets, count($dateStrings), $workerCount);
+            } else {
+                [$paths, $counts] = self::aggregateSingleProcess($inputPath, $yearOffsets);
+            }
+
+            self::writeJson($outputPath, $paths, $counts, $dateStrings);
+        } catch (FastPathUnsupported) {
+            [$paths, $counts] = self::aggregateGeneric($inputPath);
+            self::writeJsonFromDateMaps($outputPath, $paths, $counts);
         }
-
-        self::writeJson($outputPath, $paths, $counts, $dateStrings);
     }
 
     private static function resolveWorkerCount(string $inputPath): int
@@ -159,17 +164,12 @@ final class Parser
         $mergedBuffer = $mergeMode === 'sodium'
             ? str_repeat("\0", count($paths) * $dateCount * self::COUNTER_BYTES)
             : null;
+        $buffers = [];
+        $exitCodes = [];
 
         foreach ($sockets as $pid => $socket) {
-            $buffer = self::readSocket($socket);
+            $buffers[$pid] = self::readSocket($socket);
             fclose($socket);
-
-            if ($mergeMode === 'sodium') {
-                sodium_add($mergedBuffer, $buffer);
-            } else {
-                self::mergeWorkerBuffer($counts, $buffer, $dateCount);
-            }
-
             unset($sockets[$pid]);
         }
 
@@ -177,8 +177,26 @@ final class Parser
             $status = 0;
             pcntl_waitpid($pid, $status);
 
-            if (! pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
-                throw new RuntimeException("Worker {$pid} exited abnormally");
+            $exitCodes[$pid] = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : 255;
+        }
+
+        foreach ($exitCodes as $pid => $exitCode) {
+            if ($exitCode === 0) {
+                continue;
+            }
+
+            if ($exitCode === 64) {
+                throw new FastPathUnsupported('Worker encountered data outside fast-path assumptions');
+            }
+
+            throw new RuntimeException("Worker {$pid} exited abnormally");
+        }
+
+        foreach ($buffers as $buffer) {
+            if ($mergeMode === 'sodium') {
+                sodium_add($mergedBuffer, $buffer);
+            } else {
+                self::mergeWorkerBuffer($counts, $buffer, $dateCount);
             }
         }
 
@@ -204,6 +222,7 @@ final class Parser
 
         $paths = [];
         $slugIndexes = [];
+        $lastDiscoveryOffset = 0;
 
         while (($line = fgets($handle)) !== false) {
             $comma = strpos($line, ',');
@@ -214,14 +233,19 @@ final class Parser
 
             $slug = substr($line, self::URL_PREFIX_LENGTH, $comma - self::URL_PREFIX_LENGTH);
 
-            if (isset($slugIndexes[$slug])) {
-                continue;
+            if (! isset($slugIndexes[$slug])) {
+                $slugIndexes[$slug] = count($paths);
+                $paths[] = '/blog/' . $slug;
+                $lastDiscoveryOffset = ftell($handle) ?: $lastDiscoveryOffset;
             }
 
-            $slugIndexes[$slug] = count($paths);
-            $paths[] = '/blog/' . $slug;
+            $offset = ftell($handle);
 
-            if (count($paths) >= self::EXPECTED_PATH_COUNT) {
+            if (
+                $offset !== false
+                && $lastDiscoveryOffset !== 0
+                && $offset - $lastDiscoveryOffset >= self::DISCOVERY_IDLE_BYTES
+            ) {
                 break;
             }
         }
@@ -298,6 +322,12 @@ final class Parser
             self::writeSocket($socket, $buffer);
             fclose($socket);
             exit(0);
+        } catch (FastPathUnsupported) {
+            if (is_resource($socket)) {
+                fclose($socket);
+            }
+
+            exit(64);
         } catch (Throwable $throwable) {
             fwrite(STDERR, $throwable->getMessage() . PHP_EOL);
 
@@ -409,7 +439,7 @@ final class Parser
             $pathIndex = $slugIndexes[$slug] ?? null;
 
             if ($pathIndex === null) {
-                throw new RuntimeException("Encountered undiscovered slug: {$slug}");
+                throw new FastPathUnsupported("Encountered undiscovered slug: {$slug}");
             }
 
             $dateIndex = self::dateIndexFromLine($data, $comma, $yearOffsets);
@@ -424,7 +454,7 @@ final class Parser
                 $highByte = ord($countsBuffer[$highOffset]);
 
                 if ($highByte === 255) {
-                    throw new RuntimeException('Counter overflowed 16-bit storage');
+                    throw new FastPathUnsupported('Counter overflowed 16-bit storage');
                 }
 
                 $countsBuffer[$highOffset] = $nextBytes[$highByte];
@@ -462,7 +492,7 @@ final class Parser
             $pathIndex = $slugIndexes[$slug] ?? null;
 
             if ($pathIndex === null) {
-                throw new RuntimeException("Encountered undiscovered slug: {$slug}");
+                throw new FastPathUnsupported("Encountered undiscovered slug: {$slug}");
             }
 
             $dateIndex = self::dateIndexFromLine($data, $comma, $yearOffsets);
@@ -477,7 +507,7 @@ final class Parser
                 $highByte = ord($countsBuffer[$highOffset]);
 
                 if ($highByte === 255) {
-                    throw new RuntimeException('Counter overflowed 16-bit storage');
+                    throw new FastPathUnsupported('Counter overflowed 16-bit storage');
                 }
 
                 $countsBuffer[$highOffset] = $nextBytes[$highByte];
@@ -690,6 +720,10 @@ final class Parser
             ? self::LEAP_MONTH_OFFSETS
             : self::MONTH_OFFSETS;
 
+        if (! isset($yearOffsets[$year])) {
+            throw new FastPathUnsupported("Year {$year} is outside the fast-path calendar range");
+        }
+
         return $yearOffsets[$year] + $monthOffsets[$month] + $day - 1;
     }
 
@@ -717,6 +751,58 @@ final class Parser
     private static function isLeapYear(int $year): bool
     {
         return $year % 400 === 0 || ($year % 4 === 0 && $year % 100 !== 0);
+    }
+
+    /**
+     * The optimized path assumes the challenge's current data shape so it can
+     * use dense date indexes and compact worker buffers. If an input file falls
+     * outside those fast-path assumptions, this generic parser preserves
+     * correctness using only the original CSV and JSON requirements.
+     *
+     * @return array{0: list<string>, 1: array<int, array<string, int>>}
+     */
+    private static function aggregateGeneric(string $inputPath): array
+    {
+        $handle = fopen($inputPath, 'rb');
+
+        if ($handle === false) {
+            throw new RuntimeException("Unable to open input file: {$inputPath}");
+        }
+
+        stream_set_read_buffer($handle, 0);
+
+        $paths = [];
+        $pathIndexes = [];
+        $counts = [];
+
+        while (($line = fgets($handle)) !== false) {
+            $comma = strpos($line, ',');
+
+            if ($comma === false) {
+                continue;
+            }
+
+            $path = substr($line, self::PATH_OFFSET, $comma - self::PATH_OFFSET);
+            $date = substr($line, $comma + 1, 10);
+
+            if (! isset($pathIndexes[$path])) {
+                $pathIndexes[$path] = count($paths);
+                $paths[] = $path;
+                $counts[] = [];
+            }
+
+            $pathIndex = $pathIndexes[$path];
+
+            if (isset($counts[$pathIndex][$date])) {
+                $counts[$pathIndex][$date]++;
+            } else {
+                $counts[$pathIndex][$date] = 1;
+            }
+        }
+
+        fclose($handle);
+
+        return [$paths, $counts];
     }
 
     /**
@@ -764,6 +850,49 @@ final class Parser
         fclose($handle);
     }
 
+    /**
+     * @param list<string> $paths
+     * @param array<int, array<string, int>> $counts
+     */
+    private static function writeJsonFromDateMaps(string $outputPath, array $paths, array $counts): void
+    {
+        $handle = fopen($outputPath, 'wb');
+
+        if ($handle === false) {
+            throw new RuntimeException("Unable to open output file: {$outputPath}");
+        }
+
+        stream_set_write_buffer($handle, 1_048_576);
+
+        fwrite($handle, '{');
+        $firstPath = true;
+
+        foreach ($paths as $pathIndex => $path) {
+            if ($counts[$pathIndex] === []) {
+                continue;
+            }
+
+            ksort($counts[$pathIndex]);
+
+            fwrite($handle, $firstPath ? "\n" : ",\n");
+            fwrite($handle, '    ' . self::encodePath($path) . ': {');
+
+            $firstDate = true;
+
+            foreach ($counts[$pathIndex] as $date => $count) {
+                fwrite($handle, $firstDate ? "\n" : ",\n");
+                fwrite($handle, '        "' . $date . '": ' . $count);
+                $firstDate = false;
+            }
+
+            fwrite($handle, "\n    }");
+            $firstPath = false;
+        }
+
+        fwrite($handle, $firstPath ? '}' : "\n}");
+        fclose($handle);
+    }
+
     private static function encodePath(string $path): string
     {
         static $encoded = [];
@@ -771,3 +900,5 @@ final class Parser
         return $encoded[$path] ??= '"' . str_replace('/', '\\/', $path) . '"';
     }
 }
+
+final class FastPathUnsupported extends RuntimeException {}
