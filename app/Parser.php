@@ -18,6 +18,8 @@ final class Parser
     private const int MULTI_PROCESS_THRESHOLD_BYTES = 134_217_728;
     private const int READ_CHUNK_BYTES = 262_144;
     private const int COUNTER_BYTES = 2;
+    private const string DEFAULT_MERGE_MODE = 'manual';
+    private const int DEFAULT_UNROLL = 1;
     private const array MONTH_OFFSETS = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     private const array LEAP_MONTH_OFFSETS = [0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
 
@@ -113,6 +115,7 @@ final class Parser
         [$paths, $slugIndexes] = self::discoverPaths($inputPath);
         $boundaries = self::calculateChunkBoundaries($inputPath, $workerCount);
         $actualWorkers = count($boundaries) - 1;
+        $mergeMode = self::resolveMergeMode();
 
         if ($actualWorkers <= 1) {
             return self::aggregateSingleProcess($inputPath, $yearOffsets);
@@ -153,11 +156,20 @@ final class Parser
         }
 
         $counts = array_fill(0, count($paths), []);
+        $mergedBuffer = $mergeMode === 'sodium'
+            ? str_repeat("\0", count($paths) * $dateCount * self::COUNTER_BYTES)
+            : null;
 
         foreach ($sockets as $pid => $socket) {
             $buffer = self::readSocket($socket);
             fclose($socket);
-            self::mergeWorkerBuffer($counts, $buffer, $dateCount);
+
+            if ($mergeMode === 'sodium') {
+                sodium_add($mergedBuffer, $buffer);
+            } else {
+                self::mergeWorkerBuffer($counts, $buffer, $dateCount);
+            }
+
             unset($sockets[$pid]);
         }
 
@@ -168,6 +180,10 @@ final class Parser
             if (! pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
                 throw new RuntimeException("Worker {$pid} exited abnormally");
             }
+        }
+
+        if ($mergeMode === 'sodium') {
+            $counts = self::decodeDenseBuffer($mergedBuffer, count($paths), $dateCount);
         }
 
         return [$paths, $counts];
@@ -317,9 +333,11 @@ final class Parser
         $remaining = $end - $start;
         $carry = '';
         $nextBytes = self::byteLookup();
+        $readChunkBytes = self::resolveReadChunkBytes();
+        $unrollFactor = self::resolveUnrollFactor();
 
         while ($remaining > 0) {
-            $chunk = fread($handle, min(self::READ_CHUNK_BYTES, $remaining));
+            $chunk = fread($handle, min($readChunkBytes, $remaining));
 
             if ($chunk === false) {
                 fclose($handle);
@@ -347,11 +365,11 @@ final class Parser
                 $carry = '';
             }
 
-            self::consumeBuffer($data, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes);
+            self::consumeBuffer($data, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
         }
 
         if ($carry !== '') {
-            self::consumeBuffer($carry, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes);
+            self::consumeBuffer($carry, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
         }
 
         fclose($handle);
@@ -370,11 +388,109 @@ final class Parser
         array $yearOffsets,
         int $dateCount,
         array $nextBytes,
+        int $unrollFactor,
+    ): void {
+        if ($unrollFactor >= 2) {
+            self::consumeBufferUnrolled2($data, $countsBuffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes);
+            return;
+        }
+
+        $lineStart = 0;
+        $dataLength = strlen($data);
+
+        while ($lineStart < $dataLength) {
+            $comma = strpos($data, ',', $lineStart + self::URL_PREFIX_LENGTH);
+
+            if ($comma === false) {
+                break;
+            }
+
+            $slug = substr($data, $lineStart + self::URL_PREFIX_LENGTH, $comma - $lineStart - self::URL_PREFIX_LENGTH);
+            $pathIndex = $slugIndexes[$slug] ?? null;
+
+            if ($pathIndex === null) {
+                throw new RuntimeException("Encountered undiscovered slug: {$slug}");
+            }
+
+            $dateIndex = self::dateIndexFromLine($data, $comma, $yearOffsets);
+            $counterOffset = (($pathIndex * $dateCount) + $dateIndex) * self::COUNTER_BYTES;
+            $lowByte = ord($countsBuffer[$counterOffset]);
+
+            if ($lowByte !== 255) {
+                $countsBuffer[$counterOffset] = $nextBytes[$lowByte];
+            } else {
+                $countsBuffer[$counterOffset] = "\0";
+                $highOffset = $counterOffset + 1;
+                $highByte = ord($countsBuffer[$highOffset]);
+
+                if ($highByte === 255) {
+                    throw new RuntimeException('Counter overflowed 16-bit storage');
+                }
+
+                $countsBuffer[$highOffset] = $nextBytes[$highByte];
+            }
+
+            $lineStart = isset($data[$comma + self::LINE_SUFFIX_LENGTH - 1]) && $data[$comma + self::LINE_SUFFIX_LENGTH - 1] === "\n"
+                ? $comma + self::LINE_SUFFIX_LENGTH
+                : $dataLength;
+        }
+    }
+
+    /**
+     * @param array<string, int> $slugIndexes
+     * @param list<string> $nextBytes
+     */
+    private static function consumeBufferUnrolled2(
+        string $data,
+        string &$countsBuffer,
+        array $slugIndexes,
+        array $yearOffsets,
+        int $dateCount,
+        array $nextBytes,
     ): void {
         $lineStart = 0;
         $dataLength = strlen($data);
 
         while ($lineStart < $dataLength) {
+            $comma = strpos($data, ',', $lineStart + self::URL_PREFIX_LENGTH);
+
+            if ($comma === false) {
+                break;
+            }
+
+            $slug = substr($data, $lineStart + self::URL_PREFIX_LENGTH, $comma - $lineStart - self::URL_PREFIX_LENGTH);
+            $pathIndex = $slugIndexes[$slug] ?? null;
+
+            if ($pathIndex === null) {
+                throw new RuntimeException("Encountered undiscovered slug: {$slug}");
+            }
+
+            $dateIndex = self::dateIndexFromLine($data, $comma, $yearOffsets);
+            $counterOffset = (($pathIndex * $dateCount) + $dateIndex) * self::COUNTER_BYTES;
+            $lowByte = ord($countsBuffer[$counterOffset]);
+
+            if ($lowByte !== 255) {
+                $countsBuffer[$counterOffset] = $nextBytes[$lowByte];
+            } else {
+                $countsBuffer[$counterOffset] = "\0";
+                $highOffset = $counterOffset + 1;
+                $highByte = ord($countsBuffer[$highOffset]);
+
+                if ($highByte === 255) {
+                    throw new RuntimeException('Counter overflowed 16-bit storage');
+                }
+
+                $countsBuffer[$highOffset] = $nextBytes[$highByte];
+            }
+
+            $lineStart = isset($data[$comma + self::LINE_SUFFIX_LENGTH - 1]) && $data[$comma + self::LINE_SUFFIX_LENGTH - 1] === "\n"
+                ? $comma + self::LINE_SUFFIX_LENGTH
+                : $dataLength;
+
+            if ($lineStart >= $dataLength) {
+                break;
+            }
+
             $comma = strpos($data, ',', $lineStart + self::URL_PREFIX_LENGTH);
 
             if ($comma === false) {
@@ -439,6 +555,29 @@ final class Parser
     }
 
     /**
+     * @return array<int, array<int, int>>
+     */
+    private static function decodeDenseBuffer(string $buffer, int $pathCount, int $dateCount): array
+    {
+        $counts = array_fill(0, $pathCount, []);
+        $byteOffset = 0;
+
+        foreach ($counts as &$pathCounts) {
+            for ($dateIndex = 0; $dateIndex < $dateCount; $dateIndex++, $byteOffset += self::COUNTER_BYTES) {
+                $value = ord($buffer[$byteOffset]) | (ord($buffer[$byteOffset + 1]) << 8);
+
+                if ($value !== 0) {
+                    $pathCounts[$dateIndex] = $value;
+                }
+            }
+        }
+
+        unset($pathCounts);
+
+        return $counts;
+    }
+
+    /**
      * @return list<string>
      */
     private static function byteLookup(): array
@@ -493,6 +632,39 @@ final class Parser
         }
 
         return $buffer;
+    }
+
+    private static function resolveReadChunkBytes(): int
+    {
+        $configured = getenv('TEMPEST_PARSER_CHUNK_BYTES');
+
+        if ($configured !== false && $configured !== '') {
+            return max(8_192, (int) $configured);
+        }
+
+        return self::READ_CHUNK_BYTES;
+    }
+
+    private static function resolveMergeMode(): string
+    {
+        $configured = getenv('TEMPEST_PARSER_MERGE');
+
+        if ($configured === 'sodium') {
+            return 'sodium';
+        }
+
+        return self::DEFAULT_MERGE_MODE;
+    }
+
+    private static function resolveUnrollFactor(): int
+    {
+        $configured = getenv('TEMPEST_PARSER_UNROLL');
+
+        if ($configured !== false && $configured !== '') {
+            return max(1, (int) $configured);
+        }
+
+        return self::DEFAULT_UNROLL;
     }
 
     private static function dateIndexFromLine(string $line, int $comma, array $yearOffsets): int
