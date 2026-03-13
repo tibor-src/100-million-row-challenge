@@ -363,3 +363,66 @@ An extra optimization attempt replaced the trusted packed-loop date lookup map w
 - action: change reverted immediately
 
 Conclusion from this attempt: in this runtime profile, hash-map lookup for the 7-char date key remains faster than this arithmetic variant in the hottest loop.
+
+## Iteration 8 — architectural review + contender parameter audit
+
+- **Commit:** `651c8cba60e8b9768c79e2b990cb058e4cf691a7`
+- **Status:** validation passing, output hash unchanged
+
+### DataParseCommand style check across contenders
+
+Checked PR #3, PR #203, and PR #266:
+
+- all three keep `DataParseCommand` invocation as `new Parser()->parse(...)`
+- all three parser `parse()` methods are static
+- only PR #3 has a `tempest` entry-script bypass
+
+To align with that pattern under compliance mode, this iteration switched our command invocation back to instance-style (`new Parser()->parse(...)`), while keeping the static parser method.
+
+### Function/parameter audit applied
+
+Compared our parser IPC path against contender function usage and tested two retained changes:
+
+1. set socket chunk size with `stream_set_chunk_size()` for worker socket pairs
+2. replace manual `fread()` loop in parent socket reads with `stream_get_contents()`
+
+### Full-size benchmark after retained IPC tuning
+
+| Mode | Result |
+|------|--------|
+| profiled run | 3.116s observed wall time (`total_parse_ms` ≈ 2916.7) |
+| unprofiled run set | 3.146s median (5 runs) |
+
+This is a measurable improvement versus the earlier compliance+host-aware baseline (3.195s median in iteration 6).
+
+### Architectural option check (SPL/static structures)
+
+A focused synthetic microbench (20M counter increments, `268*2191` slots) was used to compare candidate structures:
+
+| Structure | Time | Peak memory |
+|----------|------|-------------|
+| packed PHP array (`array_fill`) | ~0.232s | ~18MB |
+| `SplFixedArray` | ~0.342s | ~11MB |
+| binary string byte buffer | ~0.342s | ~2MB |
+
+Interpretation for this parser:
+
+- packed arrays can be faster per increment in isolation, but they increase worker memory and IPC payload substantially
+- `SplFixedArray` saves memory but was slower here
+- binary strings remain the best fit for high worker counts because of much lower per-worker memory and compact IPC/merge behavior
+
+### Large-machine (8+ core) strategy implications
+
+Current host-aware defaults now map reasonably to larger machines:
+
+- CPU-aware worker count with cap (`MAX_WORKERS=16`)
+- dynamic chunk target (`8MB..32MB`) based on file size and workers
+- larger read chunks for large inputs
+- trust-fast-path enabled by default only for large files (still overridable)
+
+On this 4-core VM, spot checks continue to show:
+
+- best range around 8 workers for this workload profile
+- PR #203 still ahead in absolute median
+
+But this pass improved compliance-path throughput while keeping adaptability and contender-aligned command behavior.
