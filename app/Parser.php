@@ -418,56 +418,27 @@ final class Parser
     ): never {
         try {
             $buffer = str_repeat("\0", count($slugIndexes) * $dateCount * self::WORKER_COUNTER_BYTES);
-            $nextBytes = self::byteLookup();
-            $unrollFactor = self::resolveUnrollFactor();
-            $handle = fopen($inputPath, 'rb');
 
-            if ($handle === false) {
-                throw new RuntimeException("Unable to open input file: {$inputPath}");
+            for ($chunkIndex = $workerIndex; $chunkIndex < count($chunkRanges); $chunkIndex += $workerCount) {
+                [$start, $end] = $chunkRanges[$chunkIndex];
+
+                self::parseChunk(
+                    $inputPath,
+                    $start,
+                    $end,
+                    $slugIndexes,
+                    $yearOffsets,
+                    $dateIdsShort,
+                    $packedTailMap,
+                    $tailLength,
+                    $tailOffset,
+                    $fence,
+                    $dateCount,
+                    $trustFastPath,
+                    $readChunkBytes,
+                    $buffer,
+                );
             }
-
-            stream_set_read_buffer($handle, 0);
-
-            if ($packedTailMap !== []) {
-                for ($chunkIndex = $workerIndex; $chunkIndex < count($chunkRanges); $chunkIndex += $workerCount) {
-                    [$start, $end] = $chunkRanges[$chunkIndex];
-
-                    self::parsePackedChunk(
-                        $handle,
-                        $start,
-                        $end,
-                        $dateIdsShort,
-                        $packedTailMap,
-                        $tailLength,
-                        $tailOffset,
-                        $fence,
-                        $dateCount,
-                        $trustFastPath,
-                        $readChunkBytes,
-                        $nextBytes,
-                        $buffer,
-                    );
-                }
-            } else {
-                for ($chunkIndex = $workerIndex; $chunkIndex < count($chunkRanges); $chunkIndex += $workerCount) {
-                    [$start, $end] = $chunkRanges[$chunkIndex];
-
-                    self::parseChunkGeneric(
-                        $handle,
-                        $start,
-                        $end,
-                        $slugIndexes,
-                        $yearOffsets,
-                        $dateCount,
-                        $readChunkBytes,
-                        $nextBytes,
-                        $unrollFactor,
-                        $buffer,
-                    );
-                }
-            }
-
-            fclose($handle);
 
             if ($mergeMode === 'sodium') {
                 self::writeSocket($socket, chunk_split($buffer, 1, "\0"));
@@ -493,10 +464,15 @@ final class Parser
         }
     }
 
-    private static function parsePackedChunk(
-        mixed $handle,
+    /**
+     * @param array<string, int> $slugIndexes
+     */
+    private static function parseChunk(
+        string $inputPath,
         int $start,
         int $end,
+        array $slugIndexes,
+        array $yearOffsets,
         array $dateIdsShort,
         array $packedTailMap,
         int $tailLength,
@@ -505,79 +481,76 @@ final class Parser
         int $dateCount,
         bool $trustFastPath,
         int $readChunkBytes,
-        array $nextBytes,
         string &$buffer,
     ): void {
-        fseek($handle, $start);
+        $handle = fopen($inputPath, 'rb');
 
-        $remaining = $end - $start;
-
-        while ($remaining > 0) {
-            $chunk = fread($handle, min($readChunkBytes, $remaining));
-
-            if ($chunk === false) {
-                throw new RuntimeException('Unable to read chunk data');
-            }
-
-            if ($chunk === '') {
-                break;
-            }
-
-            $chunkLength = strlen($chunk);
-            $remaining -= $chunkLength;
-            $lastNewline = strrpos($chunk, "\n");
-
-            if ($lastNewline === false) {
-                break;
-            }
-
-            $tail = $chunkLength - $lastNewline - 1;
-
-            if ($tail > 0) {
-                fseek($handle, -$tail, SEEK_CUR);
-                $remaining += $tail;
-            }
-
-            self::consumePackedBuffer(
-                $chunk,
-                $buffer,
-                $packedTailMap,
-                $dateIdsShort,
-                $nextBytes,
-                $tailLength,
-                $tailOffset,
-                $fence,
-                $dateCount,
-                $trustFastPath,
-                $lastNewline,
-            );
+        if ($handle === false) {
+            throw new RuntimeException("Unable to open input file: {$inputPath}");
         }
-    }
 
-    /**
-     * @param array<string, int> $slugIndexes
-     */
-    private static function parseChunkGeneric(
-        mixed $handle,
-        int $start,
-        int $end,
-        array $slugIndexes,
-        array $yearOffsets,
-        int $dateCount,
-        int $readChunkBytes,
-        array $nextBytes,
-        int $unrollFactor,
-        string &$buffer,
-    ): void {
+        stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
 
         $remaining = $end - $start;
+        $nextBytes = self::byteLookup();
+
+        if ($packedTailMap !== []) {
+            while ($remaining > 0) {
+                $chunk = fread($handle, min($readChunkBytes, $remaining));
+
+                if ($chunk === false) {
+                    fclose($handle);
+                    throw new RuntimeException('Unable to read chunk data');
+                }
+
+                if ($chunk === '') {
+                    break;
+                }
+
+                $chunkLength = strlen($chunk);
+                $remaining -= $chunkLength;
+                $lastNewline = strrpos($chunk, "\n");
+
+                if ($lastNewline === false) {
+                    break;
+                }
+
+                $tail = $chunkLength - $lastNewline - 1;
+
+                if ($tail > 0) {
+                    fseek($handle, -$tail, SEEK_CUR);
+                    $remaining += $tail;
+                }
+
+                self::consumePackedBuffer(
+                    $chunk,
+                    $buffer,
+                    $packedTailMap,
+                    $dateIdsShort,
+                    $nextBytes,
+                    $tailLength,
+                    $tailOffset,
+                    $fence,
+                    $dateCount,
+                    $trustFastPath,
+                    $lastNewline,
+                );
+            }
+
+            fclose($handle);
+
+            return;
+        }
+
         $carry = '';
+        $unrollFactor = self::resolveUnrollFactor();
 
         while ($remaining > 0) {
             $chunk = fread($handle, min($readChunkBytes, $remaining));
 
             if ($chunk === false) {
+                fclose($handle);
                 throw new RuntimeException('Unable to read chunk data');
             }
 
@@ -608,6 +581,8 @@ final class Parser
         if ($carry !== '') {
             self::consumeBuffer($carry, $buffer, $slugIndexes, $yearOffsets, $dateCount, $nextBytes, $unrollFactor);
         }
+
+        fclose($handle);
     }
 
     /**
