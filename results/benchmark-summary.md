@@ -589,3 +589,35 @@ This pass followed a stricter versioning workflow:
 - PR #203: **2.890s median**
 
 Gap remains ~0.13s median in this window.
+
+## Iteration 12 — continued 5x stability loop and larger simplification retries
+
+This pass continued with the same rules:
+
+- version every parser change
+- 5x stability runs for key comparisons
+- always include single-core and multi-core evidence
+
+### Additional versions explored
+
+1. shared-handle retry (`eadee40`) with precomputed helper reuse in workers
+2. immediate revert (`d55602f`) after confirming regression
+
+### What was re-checked with 5x sets
+
+1. chunk-target sizes (`16MB`, `24MB`, `32MB`) under current tuned settings
+2. merge mode (`sodium` vs `manual`)
+3. socket mode (`select` vs `sequential`)
+4. worker counts (`6`, `7`, `8`) for tuned config
+
+### Findings
+
+- no new configuration surpassed previous tuned envelope
+- `sodium` merge still best
+- `select` read mode still best
+- worker count `8` remained best in tested set
+- best observed chunk-target in this pass (32MB) still did not beat PR #203 in paired 5x comparison
+
+### Current conclusion
+
+Even with repeated 5x windows and larger simplification retries, no stable repeated overtake of PR #203 has been achieved yet on this host.
