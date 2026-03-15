@@ -621,3 +621,64 @@ This pass continued with the same rules:
 ### Current conclusion
 
 Even with repeated 5x windows and larger simplification retries, no stable repeated overtake of PR #203 has been achieved yet on this host.
+
+## Iteration 13 — boundary-alignment buffering fix + host-default retune
+
+- **Parser commit:** `6947335`
+- **Status:** validation passing, output hash unchanged
+
+### Retained code changes
+
+1. removed `stream_set_read_buffer($handle, 0)` from:
+   - `discoverPaths()`
+   - `calculateChunkRanges()`
+2. retuned host-aware defaults for large files:
+   - `resolveChunkTargetBytes()` now prefers:
+     - `16MB` for files `>=4GB`
+     - `24MB` for files `>=1GB`
+   - `resolveReadChunkBytes()` now prefers:
+     - `196608` for files `>=2GB`
+     - `147456` for files `>=512MB`
+
+### Why this was retained
+
+A profiled baseline in this cycle showed the boundary phase unexpectedly expensive with the old settings:
+
+- `multi_boundaries_ms`: ~`768ms`
+- `total_parse_ms`: ~`4856ms`
+
+After removing unbuffered reads from boundary/discovery handles:
+
+- `multi_boundaries_ms`: ~`0.6ms`
+- `total_parse_ms`: ~`2917ms` on the same tuned env window
+
+### 100M benchmark highlights from this cycle
+
+1. tuned env recheck (`target=32MB`, `chunk=147456`, 5x): ~`3.035s` median
+2. post-fix chunk-target sweep:
+   - 8MB: 3.346s (single-run probe)
+   - 16MB: 2.981s (single-run probe)
+   - 24MB: 3.016s (single-run probe)
+   - 32MB: 3.028s (single-run probe)
+3. best tuned window in this cycle:
+   - `target=16MB`, `chunk=196608` → **2.995s median (5x)**
+
+### Default-mode result after retuning heuristics
+
+- command: `php tempest data:parse --input-path=/workspace/data/data.csv --output-path=/workspace/data/data.json`
+- 5-run median: **3.025s**
+
+This is a noticeable default-path improvement over the prior low-3.1s envelope.
+
+### Single-core evidence
+
+- `TEMPEST_PARSER_WORKERS=1` (3-run sample): median around **46.114s** in this run window.
+
+### Top-3 refresh (same cycle)
+
+- current branch default median: **3.025s**
+- PR #203 median (5x): **2.856s**
+- PR #3 median (3x): **3.309s**
+- PR #266 median (3x): **3.304s**
+
+Current branch remains behind PR #203, while staying ahead of PR #3 and PR #266 in this window.
