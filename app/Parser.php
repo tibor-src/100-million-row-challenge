@@ -380,8 +380,6 @@ final class Parser
             throw new RuntimeException("Unable to open input file: {$inputPath}");
         }
 
-        stream_set_read_buffer($handle, 0);
-
         $chunkTarget = self::resolveChunkTargetBytes($fileSize, $workerCount);
         $ranges = [];
         $start = 0;
@@ -1066,11 +1064,11 @@ final class Parser
         }
 
         if ($fileSize >= 2_147_483_648) {
-            return 163_840;
+            return 196_608;
         }
 
         if ($fileSize >= 536_870_912) {
-            return 131_072;
+            return 147_456;
         }
 
         return 65_536;
@@ -1093,6 +1091,14 @@ final class Parser
 
         if ($configured !== false && $configured !== '') {
             return max(1_048_576, (int) $configured);
+        }
+
+        if ($fileSize >= 4_294_967_296) {
+            return 16_777_216;
+        }
+
+        if ($fileSize >= 1_073_741_824) {
+            return 25_165_824;
         }
 
         if ($fileSize <= 0) {
@@ -1329,8 +1335,6 @@ final class Parser
         if ($handle === false) {
             throw new RuntimeException("Unable to open input file: {$inputPath}");
         }
-
-        stream_set_read_buffer($handle, 0);
 
         $paths = [];
         $pathIndexes = [];
