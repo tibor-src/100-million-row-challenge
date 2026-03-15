@@ -1,0 +1,116 @@
+{
+    "php": "8.5.3",
+    "timestamp": "2026-03-13T17:11:05+00:00",
+    "results": [
+        {
+            "name": "min()_vs_branch:min",
+            "runs_ms": [
+                123.471475,
+                124.286401,
+                126.650136
+            ],
+            "median_ms": 124.286401,
+            "avg_ms": 124.80267066666666,
+            "peak_mb": 2
+        },
+        {
+            "name": "min()_vs_branch:branch",
+            "runs_ms": [
+                95.694124,
+                96.07781,
+                96.201793
+            ],
+            "median_ms": 96.07781,
+            "avg_ms": 95.99124233333333,
+            "peak_mb": 2
+        },
+        {
+            "name": "date_extract:substr(7)",
+            "runs_ms": [
+                312.252996,
+                313.627366,
+                314.096232
+            ],
+            "median_ms": 313.627366,
+            "avg_ms": 313.32553133333334,
+            "peak_mb": 2
+        },
+        {
+            "name": "date_extract:char_concat(7)",
+            "runs_ms": [
+                882.13088,
+                883.343187,
+                891.264408
+            ],
+            "median_ms": 883.343187,
+            "avg_ms": 885.5794916666667,
+            "peak_mb": 2
+        },
+        {
+            "name": "byte_increment:lookup_table",
+            "runs_ms": [
+                203.469746,
+                204.353036,
+                204.6332
+            ],
+            "median_ms": 204.353036,
+            "avg_ms": 204.15199399999997,
+            "peak_mb": 2
+        },
+        {
+            "name": "byte_increment:ord_chr",
+            "runs_ms": [
+                283.400542,
+                284.767069,
+                286.159192
+            ],
+            "median_ms": 284.767069,
+            "avg_ms": 284.775601,
+            "peak_mb": 2
+        },
+        {
+            "name": "map_lookup:coalesce",
+            "runs_ms": [
+                407.755037,
+                408.357499,
+                416.894479
+            ],
+            "median_ms": 408.357499,
+            "avg_ms": 411.0023383333334,
+            "peak_mb": 2
+        },
+        {
+            "name": "map_lookup:isset_then_index",
+            "runs_ms": [
+                503.976062,
+                504.118098,
+                513.943405
+            ],
+            "median_ms": 504.118098,
+            "avg_ms": 507.34585500000003,
+            "peak_mb": 2
+        },
+        {
+            "name": "newline_search:strrpos",
+            "runs_ms": [
+                2.564671,
+                2.566921,
+                2.586653
+            ],
+            "median_ms": 2.566921,
+            "avg_ms": 2.572748333333333,
+            "peak_mb": 2
+        },
+        {
+            "name": "newline_search:reverse_loop",
+            "runs_ms": [
+                2.88769,
+                2.917801,
+                2.983884
+            ],
+            "median_ms": 2.917801,
+            "avg_ms": 2.9297916666666666,
+            "peak_mb": 2
+        }
+    ]
+}
